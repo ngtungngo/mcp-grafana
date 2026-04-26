@@ -10,6 +10,7 @@ wheels/
 .vscode/
 .env
 .cursor/
+.idea/
 
 # UI app build artifacts
 ui/*/node_modules/
