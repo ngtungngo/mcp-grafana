@@ -65,7 +65,7 @@ func (StringOrSlice) JSONSchema() *jsonschema.Schema {
 }
 
 type GetPanelImageParams struct {
-	DashboardUID string                   `json:"dashboardUid" jsonschema:"required,description=The UID of the dashboard containing the panel"`
+	DashboardUID string                   `json:"dashboardUid,omitempty" jsonschema:"description=The UID of a stored dashboard containing the panel. Required unless provisioningPreview is provided."`
 	PanelID      *int                     `json:"panelId,omitempty" jsonschema:"description=The ID of the panel to render. If omitted\\, the entire dashboard is rendered"`
 	Width        *int                     `json:"width,omitempty" jsonschema:"description=Width of the rendered image in pixels. Defaults to 1000"`
 	Height       *int                     `json:"height,omitempty" jsonschema:"description=Height of the rendered image in pixels. Defaults to 500"`
@@ -74,6 +74,10 @@ type GetPanelImageParams struct {
 	Theme        *string                  `json:"theme,omitempty" jsonschema:"description=Theme for the rendered image: light or dark. Defaults to dark"`
 	Scale        *int                     `json:"scale,omitempty" jsonschema:"description=Scale factor for the image (1-3). Defaults to 1"`
 	Timeout      *int                     `json:"timeout,omitempty" jsonschema:"description=Rendering timeout in seconds. Defaults to 60"`
+	// ProvisioningPreview renders a dashboard from a provisioning repository
+	// branch that has not yet been merged or applied. Mutually exclusive with
+	// dashboardUid.
+	ProvisioningPreview *ProvisioningPreview `json:"provisioningPreview,omitempty" jsonschema:"description=Render a dashboard from a provisioning repository branch (e.g. a git-sync PR preview). Mutually exclusive with dashboardUid."`
 }
 
 type RenderTimeRange struct {
@@ -81,32 +85,56 @@ type RenderTimeRange struct {
 	To   string `json:"to" jsonschema:"description=End time (e.g.\\, 'now'\\, '2024-01-01T12:00:00Z')"`
 }
 
+// ProvisioningPreview identifies a not-yet-applied dashboard inside a
+// provisioning repository, e.g. one staged on a feature branch via git-sync.
+// The renderer loads the dashboard at /dashboard/provisioning/<repo>/preview/<path>
+// instead of looking it up by UID.
+type ProvisioningPreview struct {
+	Repo string `json:"repo" jsonschema:"required,description=Provisioning repository slug. List repositories via /apis/provisioning.grafana.app/v0alpha1/namespaces/default/repositories if unknown."`
+	Path string `json:"path" jsonschema:"required,description=Path to the dashboard file within the repository\\, relative to its root."`
+	Ref  string `json:"ref,omitempty" jsonschema:"description=Branch or commit SHA to render from. Defaults to the repository's main branch when omitted."`
+}
+
 func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallToolResult, error) {
 	config := mcpgrafana.GrafanaConfigFromContext(ctx)
 	baseURL := config.URL
 
 	if baseURL == "" {
-		return nil, fmt.Errorf("grafana URL not configured. Please set GRAFANA_URL environment variable or X-Grafana-URL header")
+		return nil, fmt.Errorf("grafana URL not configured. Please set GRAFANA_URL environment variable")
 	}
 
-	// Build the render URL
-	renderURL, err := buildRenderURL(baseURL, args)
+	// The org to render from comes from config.OrgID, which
+	// OrgIDOverrideMiddleware sets from the per-call orgId argument when dynamic
+	// multi-org is enabled and which otherwise carries the connection's org. This
+	// tool declares no orgId of its own, so it behaves like every other tool: the
+	// argument exists only when --dynamic-multi-org is set. Reading the org from
+	// the context also keeps the X-Grafana-Org-Id header the transport adds in
+	// step with the render URL's targetOrgId.
+	renderOrg := config.OrgID
+
+	renderURL, err := buildRenderURL(baseURL, renderOrg, args)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build render URL: %w", err)
 	}
 
-	// Create HTTP client with TLS configuration if available
-	httpClient, err := createHTTPClient(config)
+	// Build the HTTP transport using the shared middleware chain (TLS, auth,
+	// extra headers, org ID, user-agent, otel). Using config.HTTPTransport()
+	// as the base ensures we respect BaseTransport when set (e.g. the hosted
+	// Cloud MCP server injects a pre-configured transport with custom
+	// instrumentation).
+	transport, err := mcpgrafana.BuildTransport(&config, config.HTTPTransport())
 	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
+		return nil, fmt.Errorf("failed to build HTTP transport: %w", err)
 	}
 
-	// Set timeout for rendering
 	timeout := 60 * time.Second
 	if args.Timeout != nil && *args.Timeout > 0 {
 		timeout = time.Duration(*args.Timeout) * time.Second
 	}
-	httpClient.Timeout = timeout
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}
 
 	// Create request
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, renderURL, nil)
@@ -143,33 +171,93 @@ func getPanelImage(ctx context.Context, args GetPanelImageParams) (*mcp.CallTool
 	// Return the image as base64 encoded data using MCP's image content type
 	base64Data := base64.StdEncoding.EncodeToString(imageData)
 
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			mcp.ImageContent{
-				Type:     "image",
-				Data:     base64Data,
-				MIMEType: "image/png",
-			},
+	// Rendering succeeded, so always return the image. The deeplink is
+	// best-effort metadata added only if it builds successfully.
+	content := []mcp.Content{
+		mcp.ImageContent{
+			Type:     "image",
+			Data:     base64Data,
+			MIMEType: "image/png",
 		},
+	}
+
+	// Use the public base URL, not config.URL, which may be an in-cluster
+	// endpoint the browser can't reach.
+	if deeplinkBase, err := grafanaBaseURLFromContext(ctx); err == nil && deeplinkResolvesInRenderOrg(ctx, renderOrg) {
+		if deeplink, err := buildDashboardDeeplink(deeplinkBase, args); err == nil {
+			content = append(content, mcp.TextContent{
+				Meta: mcpgrafana.NewUIContentMeta(mcpgrafana.UIContentKindDeeplink),
+				Type: "text",
+				Text: deeplink,
+			})
+		}
+	}
+
+	return &mcp.CallToolResult{
+		Content: content,
 	}, nil
 }
 
-func buildRenderURL(baseURL string, args GetPanelImageParams) (string, error) {
+func buildRenderURL(baseURL string, orgID int64, args GetPanelImageParams) (string, error) {
+	// Validate that exactly one source is set.
+	hasUID := args.DashboardUID != ""
+	hasPreview := args.ProvisioningPreview != nil
+	if hasUID == hasPreview {
+		if hasUID {
+			return "", fmt.Errorf("dashboardUid and provisioningPreview are mutually exclusive; pass exactly one")
+		}
+		return "", fmt.Errorf("either dashboardUid or provisioningPreview must be set")
+	}
+	if hasPreview {
+		if err := validateRepoSlug("provisioningPreview.repo", args.ProvisioningPreview.Repo); err != nil {
+			return "", err
+		}
+		if err := validateRepoPath("provisioningPreview.path", args.ProvisioningPreview.Path); err != nil {
+			return "", err
+		}
+	}
+
 	// Strip trailing slashes from base URL for consistent URL construction
 	baseURL = strings.TrimRight(baseURL, "/")
 
 	// Build query parameters
 	params := url.Values{}
 
-	// Single-panel renders use the purpose-built /d-solo route (lighter than loading
-	// the full dashboard with viewPanel). Full dashboard renders use /d as default.
-	renderPath := fmt.Sprintf("/render/d/%s", args.DashboardUID)
-
-	if args.PanelID != nil {
-		renderPath = fmt.Sprintf("/render/d-solo/%s", args.DashboardUID)
-		params.Set("panelId", strconv.Itoa(*args.PanelID))
+	// Choose render path. For stored dashboards we use the purpose-built /d-solo
+	// route for single-panel renders (lighter than loading the full dashboard
+	// with viewPanel); full dashboard renders use /d. For provisioning previews
+	// the same route is used for both since the preview UI handles ?panelId
+	// via the standard kiosk/viewPanel mechanism.
+	var renderPath string
+	if hasPreview {
+		// Repo is a single segment and gets the stricter url.PathEscape (which
+		// also encodes sub-delim characters like @, $, &, ;, =, :). For the
+		// multi-segment file path we use url.URL.EscapedPath() so structural /
+		// separators between segments are preserved while everything else that
+		// isn't valid in a URL path is percent-encoded. This matches the
+		// encoding done by tools/navigation.go and tools/provisioning.go.
+		// Note: we build the path by string-concatenation rather than via
+		// `url.URL{Path: ...}` because url.URL would re-escape our PathEscape
+		// output (turning %40 into %2540).
+		escapedFile := (&url.URL{Path: strings.TrimLeft(args.ProvisioningPreview.Path, "/")}).EscapedPath()
+		renderPath = fmt.Sprintf(
+			"/render/dashboard/provisioning/%s/preview/%s",
+			url.PathEscape(args.ProvisioningPreview.Repo),
+			escapedFile,
+		)
+		if args.ProvisioningPreview.Ref != "" {
+			params.Set("ref", args.ProvisioningPreview.Ref)
+		}
+		if args.PanelID != nil {
+			params.Set("viewPanel", strconv.Itoa(*args.PanelID))
+		}
+	} else {
+		renderPath = fmt.Sprintf("/render/d/%s", args.DashboardUID)
+		if args.PanelID != nil {
+			renderPath = fmt.Sprintf("/render/d-solo/%s", args.DashboardUID)
+			params.Set("panelId", strconv.Itoa(*args.PanelID))
+		}
 	}
-
 	// Set dimensions
 	width := 1000
 	height := 500
@@ -211,28 +299,113 @@ func buildRenderURL(baseURL string, args GetPanelImageParams) (string, error) {
 		}
 	}
 
+	// Select the org to render from. The image renderer drives a headless browser
+	// whose request org is set by the backend from the targetOrgId query param;
+	// the X-Grafana-Org-Id header (set by the transport) is ignored by the render
+	// path. We deliberately use targetOrgId rather than orgId: orgId is read by
+	// the frontend, which persists an org switch via /api/user/using — that would
+	// change the user's active org for every later request. targetOrgId only
+	// scopes this single render.
+	if orgID > 0 {
+		params.Set("targetOrgId", strconv.FormatInt(orgID, 10))
+	}
+
 	// Add kiosk mode options for cleaner rendering
 	params.Set("kiosk", "true")
 
 	return fmt.Sprintf("%s%s?%s", baseURL, renderPath, params.Encode()), nil
 }
 
-func createHTTPClient(config mcpgrafana.GrafanaConfig) (*http.Client, error) {
-	transport, err := mcpgrafana.BuildTransport(&config, nil)
+// deeplinkResolvesInRenderOrg reports whether a dashboard URL carrying no org
+// would open in renderOrg for this identity.
+//
+// The link cannot carry one: `?orgId=N` is intercepted by Grafana's global
+// OrgRedirect middleware, which persists the switch onto the user's record, and
+// neither targetOrgId (render backend only) nor X-Grafana-Org-Id (not sendable
+// by a browser) substitutes. So when the render org is not where the viewer would
+// land, omit the link rather than point it at the wrong dashboard — UIDs are
+// unique only within an org. The image is unaffected.
+//
+// A non-positive renderOrg means no org reached the render (as in buildRenderURL
+// and OrgIDRoundTripper), so it used the identity's own org and the link agrees,
+// checked without a request. Any other org needs the lookup, whether it came
+// from a per-call orgId or from the connection; a failed lookup omits the link.
+func deeplinkResolvesInRenderOrg(ctx context.Context, renderOrg int64) bool {
+	if renderOrg <= 0 {
+		return true
+	}
+	viewerOrg, err := mcpgrafana.UserPersistedOrgID(ctx)
 	if err != nil {
-		return nil, err
+		return false
+	}
+	return viewerOrg == renderOrg
+}
+
+// buildDashboardDeeplink returns the Grafana UI URL for the rendered
+// dashboard, mirroring buildRenderURL's view (panel, time range, variables)
+// so the deeplink matches the PNG.
+func buildDashboardDeeplink(baseURL string, args GetPanelImageParams) (string, error) {
+	baseURL = strings.TrimRight(baseURL, "/")
+
+	var uid *string
+	if args.DashboardUID != "" {
+		uid = &args.DashboardUID
+	}
+	var preview *DeeplinkProvisioningPreview
+	if args.ProvisioningPreview != nil {
+		preview = &DeeplinkProvisioningPreview{
+			Repo: args.ProvisioningPreview.Repo,
+			Path: args.ProvisioningPreview.Path,
+			Ref:  args.ProvisioningPreview.Ref,
+		}
 	}
 
-	return &http.Client{Transport: transport}, nil
+	target, err := buildDashboardTargetURL(baseURL, uid, preview)
+	if err != nil {
+		return "", err
+	}
+
+	extra := url.Values{}
+	if args.PanelID != nil {
+		extra.Set("viewPanel", strconv.Itoa(*args.PanelID))
+	}
+	if args.TimeRange != nil {
+		// Normalize RFC 3339 to epoch ms for Grafana's Scenes URL parser.
+		if args.TimeRange.From != "" {
+			extra.Set("from", toGrafanaTimeParam(args.TimeRange.From))
+		}
+		if args.TimeRange.To != "" {
+			extra.Set("to", toGrafanaTimeParam(args.TimeRange.To))
+		}
+	}
+	for key, values := range args.Variables {
+		for _, v := range values {
+			extra.Add(key, v)
+		}
+	}
+
+	if len(extra) == 0 {
+		return target, nil
+	}
+	separator := "?"
+	if strings.Contains(target, "?") {
+		separator = "&"
+	}
+	return target + separator + extra.Encode(), nil
 }
 
 var GetPanelImage = mcpgrafana.MustTool(
 	"get_panel_image",
-	"Render a Grafana dashboard panel or full dashboard as a PNG image. Returns the image as base64 encoded data. Requires the Grafana Image Renderer service to be installed. Use this for generating visual snapshots of dashboards for reports\\, alerts\\, or presentations.",
+	"Render a Grafana dashboard panel or full dashboard as a PNG image. Returns the image as base64 encoded data. Requires the Grafana Image Renderer service to be installed. "+
+		"Either dashboardUid (for stored dashboards) or provisioningPreview (for dashboards staged on a provisioning repository branch, e.g. a git-sync PR) must be supplied. "+
+		"Use this for generating visual snapshots of dashboards for reports, alerts, or presentations.",
 	getPanelImage,
 	mcp.WithTitleAnnotation("Get panel or dashboard image"),
 	mcp.WithIdempotentHintAnnotation(true),
+	mcpgrafana.WithUIResource(mcpgrafana.PanelViewerResourceURI),
 	mcp.WithReadOnlyHintAnnotation(true),
+	mcp.WithDestructiveHintAnnotation(false),
+	mcp.WithOpenWorldHintAnnotation(false),
 )
 
 func AddRenderingTools(mcp *server.MCPServer) {

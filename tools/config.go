@@ -120,7 +120,9 @@ var SuggestLokiAlloyLabelConfig = mcpgrafana.MustTool(
 	mcp.WithTitleAnnotation("Suggest Alloy label enforcement config"),
 	mcp.WithIdempotentHintAnnotation(true),
 	mcp.WithReadOnlyHintAnnotation(true),
-)
+	mcp.WithDestructiveHintAnnotation(false),
+	mcp.WithOpenWorldHintAnnotation(false),
+).NotOrgScoped()
 
 // AddConfigTools registers the config-generation tool set.
 func AddConfigTools(s *server.MCPServer) {

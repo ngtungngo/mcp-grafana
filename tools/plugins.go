@@ -129,6 +129,8 @@ var GetPlugin = mcpgrafana.MustTool(
 	mcp.WithTitleAnnotation("Get plugin"),
 	mcp.WithIdempotentHintAnnotation(true),
 	mcp.WithReadOnlyHintAnnotation(true),
+	mcp.WithDestructiveHintAnnotation(false),
+	mcp.WithOpenWorldHintAnnotation(false),
 )
 
 type InstallPluginParams struct {
@@ -163,7 +165,12 @@ func fetchLatestPluginVersion(ctx context.Context, pluginID string) (string, err
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	// grafana.com is a third party: honour a configured SOCKS5 proxy (so this
+	// request works in egress-restricted networks and never bypasses the proxy)
+	// but send no Grafana credentials or forwarded headers to it.
+	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
+	httpClient := &http.Client{Transport: cfg.ProxyOnlyTransport()}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("do request: %w", err)
 	}
@@ -230,9 +237,10 @@ var InstallPlugin = mcpgrafana.MustTool(
 	"Install a Grafana plugin by its plugin ID. If the version is not already confirmed with the user, omit it — the tool will look up the latest version and return it for confirmation before installing.",
 	installPlugin,
 	mcp.WithTitleAnnotation("Install plugin"),
-	mcp.WithReadOnlyHintAnnotation(false),
-	mcp.WithDestructiveHintAnnotation(true),
 	mcp.WithIdempotentHintAnnotation(false),
+	mcp.WithReadOnlyHintAnnotation(false),
+	mcp.WithDestructiveHintAnnotation(false),
+	mcp.WithOpenWorldHintAnnotation(true),
 )
 
 // catalogPlugin mirrors the relevant fields from the Grafana plugin catalog list API.
@@ -319,7 +327,12 @@ func searchPlugins(ctx context.Context, args SearchPluginsParams) (*SearchPlugin
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	// grafana.com is a third party: honour a configured SOCKS5 proxy (so this
+	// request works in egress-restricted networks and never bypasses the proxy)
+	// but send no Grafana credentials or forwarded headers to it.
+	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
+	httpClient := &http.Client{Transport: cfg.ProxyOnlyTransport()}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch plugin catalog: %w", err)
 	}
@@ -398,6 +411,8 @@ var SearchPlugins = mcpgrafana.MustTool(
 	mcp.WithTitleAnnotation("Search plugins"),
 	mcp.WithIdempotentHintAnnotation(true),
 	mcp.WithReadOnlyHintAnnotation(true),
+	mcp.WithDestructiveHintAnnotation(false),
+	mcp.WithOpenWorldHintAnnotation(true),
 )
 
 func AddPluginTools(s *server.MCPServer, enableWrite bool) {

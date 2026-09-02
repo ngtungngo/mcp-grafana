@@ -621,7 +621,7 @@ func TestEmptyStructJSONSchema(t *testing.T) {
 	// Verify type is object
 	assert.Equal(t, "object", inputSchemaMap["type"], "inputSchema type should be object")
 
-	// Verify that properties key exists and is an empty object
+	// Verify that properties key exists and is an object (not null/bool/omitted).
 	properties, exists := inputSchemaMap["properties"]
 	assert.True(t, exists, "properties field should exist in inputSchema")
 	assert.NotNil(t, properties, "properties should not be nil")
@@ -749,4 +749,21 @@ func TestConvertToolHandlesInterfaceFields(t *testing.T) {
 	modelObj, ok := model.(map[string]any)
 	require.True(t, ok, "model property should be an object schema, got %T", model)
 	t.Logf("model schema: %v", modelObj)
+}
+
+func TestConvertToolSchemaDisallowsAdditionalProperties(t *testing.T) {
+	tool, _, err := ConvertTool("test_tool", "A test tool", testToolHandler)
+	require.NoError(t, err)
+
+	var schema map[string]any
+	err = json.Unmarshal(tool.RawInputSchema, &schema)
+	require.NoError(t, err)
+	require.Contains(t, schema, "additionalProperties")
+	assert.Equal(t, false, schema["additionalProperties"])
+}
+
+func TestValidateNoBooleanSchemasAllowsAdditionalPropertiesFalse(t *testing.T) {
+	input := `{"type":"object","properties":{"name":{"type":"string"}},"additionalProperties":false}`
+	err := validateNoBooleanSchemas("test_tool", []byte(input))
+	assert.NoError(t, err)
 }

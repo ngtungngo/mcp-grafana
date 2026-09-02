@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -39,10 +40,10 @@ type LabelResponse struct {
 
 // Stats represents the statistics returned by Loki's index/stats endpoint
 type Stats struct {
-	Streams int `json:"streams"`
-	Chunks  int `json:"chunks"`
-	Entries int `json:"entries"`
-	Bytes   int `json:"bytes"`
+	Streams int   `json:"streams"`
+	Chunks  int   `json:"chunks"`
+	Entries int   `json:"entries"`
+	Bytes   int64 `json:"bytes"`
 }
 
 // patternsAPIResponse represents the raw response from Loki's patterns API
@@ -70,16 +71,31 @@ func newLokiClient(ctx context.Context, uid string, _ *models.DataSource) (*Clie
 	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
 	grafanaURL := cfg.URL
 	resourcesBase, proxyBase := datasourceProxyPaths(uid)
-	url := grafanaURL + proxyBase
+	primaryBase, fallbackBase := proxyBase, resourcesBase
+	legacyMode := false
+	if numericBase, uidBase, ok := fallbackProxyBases(ctx, uid); ok {
+		// Legacy-compatible routing — see newPrometheusBackend for the full
+		// rationale: route through the numeric-id proxy path directly, keeping
+		// the uid-based proxy route as the transport-level fallback.
+		primaryBase, fallbackBase = numericBase, uidBase
+		legacyMode = true
+	}
+	url := grafanaURL + primaryBase
 
 	transport, err := mcpgrafana.BuildTransport(&cfg, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create custom transport: %w", err)
 	}
 
-	// Wrap with fallback transport: try /proxy first, fall back to /resources
-	// on 403/500 for compatibility with different managed Grafana deployments.
-	rt := newDatasourceFallbackTransport(transport, proxyBase, resourcesBase)
+	// Wrap with fallback transport: try the primary base first, fall back to
+	// the alternate for compatibility with different Grafana deployments (see
+	// fallback_transport.go for the per-mode retry rules).
+	var rt http.RoundTripper
+	if legacyMode {
+		rt = newLegacyDatasourceFallbackTransport(transport, primaryBase, fallbackBase)
+	} else {
+		rt = newDatasourceFallbackTransport(transport, primaryBase, fallbackBase)
+	}
 
 	client := &http.Client{
 		Transport: rt,
@@ -91,21 +107,9 @@ func newLokiClient(ctx context.Context, uid string, _ *models.DataSource) (*Clie
 	}, nil
 }
 
-// buildURL constructs a full URL for a Loki API endpoint
-func (c *Client) buildURL(urlPath string) string {
-	fullURL := c.baseURL
-	if !strings.HasSuffix(fullURL, "/") && !strings.HasPrefix(urlPath, "/") {
-		fullURL += "/"
-	} else if strings.HasSuffix(fullURL, "/") && strings.HasPrefix(urlPath, "/") {
-		// Remove the leading slash from urlPath to avoid double slash
-		urlPath = strings.TrimPrefix(urlPath, "/")
-	}
-	return fullURL + urlPath
-}
-
 // makeRequest makes an HTTP request to the Loki API and returns the response body
 func (c *Client) makeRequest(ctx context.Context, method, urlPath string, params url.Values) ([]byte, error) {
-	fullURL := c.buildURL(urlPath)
+	fullURL := buildURL(c.baseURL, urlPath)
 
 	u, err := url.Parse(fullURL)
 	if err != nil {
@@ -195,22 +199,8 @@ func (c *Client) fetchData(ctx context.Context, urlPath string, startRFC3339, en
 // ListLokiLabelNamesParams defines the parameters for listing Loki label names
 type ListLokiLabelNamesParams struct {
 	DatasourceUID string `json:"datasourceUid" jsonschema:"required,description=The UID of the datasource to query"`
-	StartRFC3339  string `json:"startRfc3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format (defaults to 1 hour ago)"`
-	EndRFC3339    string `json:"endRfc3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format (defaults to now)"`
-}
-
-// parseRFC3339OrZero converts an RFC3339 string to a time.Time, returning a
-// zero time when the input is empty. Unparseable strings are surfaced as
-// errors so callers don't silently send garbage to the backend.
-func parseRFC3339OrZero(s string) (time.Time, error) {
-	if s == "" {
-		return time.Time{}, nil
-	}
-	t, err := time.Parse(time.RFC3339, s)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("parsing time %q: %w", s, err)
-	}
-	return t, nil
+	StartRFC3339  string `json:"startRfc3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format or relative time (e.g. 'now-1h') (defaults to 1 hour ago)"`
+	EndRFC3339    string `json:"endRfc3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format or relative time (e.g. 'now') (defaults to now)"`
 }
 
 // listLokiLabelNames lists all label names in a Loki (or VictoriaLogs) datasource
@@ -220,13 +210,13 @@ func listLokiLabelNames(ctx context.Context, args ListLokiLabelNamesParams) ([]s
 		return nil, fmt.Errorf("creating Loki backend: %w", err)
 	}
 
-	start, err := parseRFC3339OrZero(args.StartRFC3339)
+	start, err := parseStartTime(args.StartRFC3339)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing start time: %w", err)
 	}
-	end, err := parseRFC3339OrZero(args.EndRFC3339)
+	end, err := parseEndTime(args.EndRFC3339)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing end time: %w", err)
 	}
 
 	result, err := backend.ListLabelNames(ctx, start, end)
@@ -249,14 +239,16 @@ var ListLokiLabelNames = mcpgrafana.MustTool(
 	mcp.WithTitleAnnotation("List Loki label names"),
 	mcp.WithIdempotentHintAnnotation(true),
 	mcp.WithReadOnlyHintAnnotation(true),
+	mcp.WithDestructiveHintAnnotation(false),
+	mcp.WithOpenWorldHintAnnotation(false),
 )
 
 // ListLokiLabelValuesParams defines the parameters for listing Loki label values
 type ListLokiLabelValuesParams struct {
 	DatasourceUID string `json:"datasourceUid" jsonschema:"required,description=The UID of the datasource to query"`
 	LabelName     string `json:"labelName" jsonschema:"required,description=The name of the label to retrieve values for (e.g. 'app'\\, 'env'\\, 'pod')"`
-	StartRFC3339  string `json:"startRfc3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format (defaults to 1 hour ago)"`
-	EndRFC3339    string `json:"endRfc3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format (defaults to now)"`
+	StartRFC3339  string `json:"startRfc3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format or relative time (e.g. 'now-1h') (defaults to 1 hour ago)"`
+	EndRFC3339    string `json:"endRfc3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format or relative time (e.g. 'now') (defaults to now)"`
 }
 
 // listLokiLabelValues lists all values for a specific label in a Loki (or VictoriaLogs) datasource
@@ -266,13 +258,13 @@ func listLokiLabelValues(ctx context.Context, args ListLokiLabelValuesParams) ([
 		return nil, fmt.Errorf("creating Loki backend: %w", err)
 	}
 
-	start, err := parseRFC3339OrZero(args.StartRFC3339)
+	start, err := parseStartTime(args.StartRFC3339)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing start time: %w", err)
 	}
-	end, err := parseRFC3339OrZero(args.EndRFC3339)
+	end, err := parseEndTime(args.EndRFC3339)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing end time: %w", err)
 	}
 
 	result, err := backend.ListLabelValues(ctx, args.LabelName, start, end)
@@ -296,6 +288,8 @@ var ListLokiLabelValues = mcpgrafana.MustTool(
 	mcp.WithTitleAnnotation("List Loki label values"),
 	mcp.WithIdempotentHintAnnotation(true),
 	mcp.WithReadOnlyHintAnnotation(true),
+	mcp.WithDestructiveHintAnnotation(false),
+	mcp.WithOpenWorldHintAnnotation(false),
 )
 
 // LokiLogStream represents a stream of log entries from Loki (resultType: "streams")
@@ -473,12 +467,13 @@ func (c *Client) fetchQuery(ctx context.Context, p fetchQueryParams) (*lokiQuery
 type QueryLokiLogsParams struct {
 	DatasourceUID string `json:"datasourceUid" jsonschema:"required,description=The UID of the datasource to query"`
 	LogQL         string `json:"logql" jsonschema:"required,description=The LogQL query to execute against Loki. This can be a simple label matcher or a complex query with filters\\, parsers\\, and expressions. Supports full LogQL syntax including label matchers\\, filter operators\\, pattern expressions\\, and pipeline operations."`
-	StartRFC3339  string `json:"startRfc3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format"`
-	EndRFC3339    string `json:"endRfc3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format"`
+	StartRFC3339  string `json:"startRfc3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format or relative time (e.g. 'now-1h')"`
+	EndRFC3339    string `json:"endRfc3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format or relative time (e.g. 'now')"`
 	Limit         int    `json:"limit,omitempty" jsonschema:"default=10,description=Optionally\\, the maximum number of log lines to return (default max: 100\\, configurable by MCP server)."`
 	Direction     string `json:"direction,omitempty" jsonschema:"description=Optionally\\, the direction of the query: 'forward' (oldest first) or 'backward' (newest first\\, default)"`
 	QueryType     string `json:"queryType,omitempty" jsonschema:"description=Query type: 'range' (default) or 'instant'. Instant queries return a single value at one point in time. Range queries return values over a time window. Use 'instant' for metric queries when you want the current value."`
 	StepSeconds   int    `json:"stepSeconds,omitempty" jsonschema:"description=Resolution step in seconds for range metric queries. When running metric queries with queryType='range'\\, this controls the time resolution of the returned data points."`
+	Format        string `json:"format,omitempty" jsonschema:"enum=full,enum=compact,description=Output format for log (streams) queries: 'full' (default) returns every entry with its own label metadata; 'compact' groups lines by stream so each label set is emitted only once (and per-line structured/parsed metadata is dropped)\\, substantially reducing response size for broad queries. Ignored for metric queries."`
 }
 
 // QueryMetadata provides context about the query results for AI agents
@@ -494,8 +489,26 @@ type QueryMetadata struct {
 // QueryLokiLogsResult wraps the Loki query result with optional hints
 type QueryLokiLogsResult struct {
 	Data     []LogEntry        `json:"data"`
+	Streams  []CompactStream   `json:"streams,omitempty"` // Populated instead of per-entry labels when format=compact
 	Hints    *EmptyResultHints `json:"hints,omitempty"`
 	Metadata *QueryMetadata    `json:"metadata,omitempty"`
+}
+
+// CompactStream groups log lines that share the same label set. The compact
+// output format emits one CompactStream per distinct stream so labels aren't
+// repeated on every line; per-line structured metadata and parser-extracted
+// labels are intentionally omitted to minimise response size.
+type CompactStream struct {
+	Labels map[string]string `json:"labels"`
+	Lines  []CompactLine     `json:"lines"`
+}
+
+// CompactLine is a single log line in a CompactStream, carrying only the
+// timestamp and message. Named fields keep the compact payload self-describing
+// to an LLM while still avoiding the per-line label repetition of full output.
+type CompactLine struct {
+	Timestamp string `json:"timestamp"`
+	Line      string `json:"line"`
 }
 
 // LogEntry represents a single log entry or metric sample with metadata.
@@ -586,8 +599,13 @@ func parseLokiQueryResponse(response *lokiQueryResponse) ([]LogEntry, error) {
 						continue
 					}
 
+					var timestamp string
+					if err := json.Unmarshal(value[0], &timestamp); err != nil {
+						continue
+					}
+
 					entry := LogEntry{
-						Timestamp: string(value[0]),
+						Timestamp: timestamp,
 						Line:      logLine,
 						Labels:    stream.Stream,
 					}
@@ -670,7 +688,54 @@ func parseLokiQueryResponse(response *lokiQueryResponse) ([]LogEntry, error) {
 // transport (native Loki vs VictoriaLogs) is selected by the backend
 // dispatch; this function owns parameter normalization, truncation
 // detection, metadata, and empty-result hints.
+// labelsKey builds a stable, collision-resistant key for a label set so
+// entries belonging to the same stream group together regardless of map
+// iteration order.
+func labelsKey(labels map[string]string) string {
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(labels[k])
+		b.WriteByte('\x00')
+	}
+	return b.String()
+}
+
+// compactLogEntries collapses a flat slice of log entries into one
+// CompactStream per distinct label set, preserving the order in which each
+// stream first appears and the order of lines within it. Per-line structured
+// metadata and parsed labels are dropped — the compact format trades that
+// detail for a much smaller payload on broad, multi-line queries.
+func compactLogEntries(entries []LogEntry) []CompactStream {
+	streams := make([]CompactStream, 0)
+	index := make(map[string]int, len(entries))
+	for _, e := range entries {
+		key := labelsKey(e.Labels)
+		i, ok := index[key]
+		if !ok {
+			i = len(streams)
+			index[key] = i
+			streams = append(streams, CompactStream{Labels: e.Labels, Lines: []CompactLine{}})
+		}
+		streams[i].Lines = append(streams[i].Lines, CompactLine{Timestamp: e.Timestamp, Line: e.Line})
+	}
+	return streams
+}
+
 func queryLokiLogs(ctx context.Context, args QueryLokiLogsParams) (*QueryLokiLogsResult, error) {
+	format := strings.ToLower(strings.TrimSpace(args.Format))
+	switch format {
+	case "", "full", "compact":
+	default:
+		return nil, fmt.Errorf("invalid format %q: must be 'full' or 'compact'", args.Format)
+	}
+
 	backend, err := lokiBackendForDatasource(ctx, args.DatasourceUID)
 	if err != nil {
 		return nil, fmt.Errorf("creating Loki backend: %w", err)
@@ -688,12 +753,16 @@ func queryLokiLogs(ctx context.Context, args QueryLokiLogsParams) (*QueryLokiLog
 		startTimeStr, endTimeStr = getDefaultTimeRange(args.StartRFC3339, args.EndRFC3339)
 	}
 
-	startTime, err := parseRFC3339OrZero(startTimeStr)
+	startTime, err := parseStartTime(startTimeStr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing start time: %w", err)
 	}
-	endTime, err := parseRFC3339OrZero(endTimeStr)
+	endTime, err := parseEndTime(endTimeStr)
 	if err != nil {
+		return nil, fmt.Errorf("parsing end time: %w", err)
+	}
+
+	if err := guardLokiQuery(ctx, backend, args.LogQL, args.QueryType, startTime, endTime); err != nil {
 		return nil, err
 	}
 
@@ -763,17 +832,27 @@ func queryLokiLogs(ctx context.Context, args QueryLokiLogsParams) (*QueryLokiLog
 		}
 	}
 
+	// Compact format only applies to log (streams) responses; metric results
+	// carry values rather than log lines and are left untouched. Data is kept
+	// as an empty array so the field's "always a JSON array" contract holds.
+	if format == "compact" && result.ResultType == "streams" {
+		out.Streams = compactLogEntries(out.Data)
+		out.Data = []LogEntry{}
+	}
+
 	return out, nil
 }
 
 // QueryLokiLogs is a tool for querying logs from Loki
 var QueryLokiLogs = mcpgrafana.MustTool(
 	"query_loki_logs",
-	"Executes a log query against a Loki or VictoriaLogs datasource and returns matching log entries (or metric samples on Loki). Defaults to the last hour, a limit of 10 entries, and 'backward' direction (newest first). The `logql` parameter takes LogQL on Loki and LogsQL on VictoriaLogs (e.g., Loki: `{app=\"foo\"} |= \"error\"`; VictoriaLogs: `{app=\"foo\"} \"error\"`). To count matching log lines precisely, use a `count_over_time()` metric query with queryType='instant'. Prefer using `query_loki_stats` first to cheaply check whether a stream contains data (avoiding expensive queries against empty streams) and `list_loki_label_names` / `list_loki_label_values` to verify labels exist before querying. Note: `query_loki_stats` returns approximate storage-level counts, not exact log line counts.",
+	"Executes a log query against a Loki or VictoriaLogs datasource and returns matching log entries (or metric samples on Loki). Defaults to the last hour, a limit of 10 entries, and 'backward' direction (newest first). The `logql` parameter takes LogQL on Loki and LogsQL on VictoriaLogs (e.g., Loki: `{app=\"foo\"} |= \"error\"`; VictoriaLogs: `{app=\"foo\"} \"error\"`). To count matching log lines precisely, use a `count_over_time()` metric query with queryType='instant'. Prefer using `query_loki_stats` first to cheaply check whether a stream contains data (avoiding expensive queries against empty streams) and `list_loki_label_names` / `list_loki_label_values` to verify labels exist before querying. Note: `query_loki_stats` returns approximate storage-level counts, not exact log line counts. For broad queries that match many lines, set `format` to 'compact' to group results by stream and avoid repeating label metadata on every line. If this server enables the Loki cost guardrail, expensive queries are rejected before execution: query cost is bytes SCANNED, determined only by the stream selector and time range — line filters (|=) and parsers (| json) reduce what is returned, not what is scanned. Use a stream selector with at least one selective positive label matcher (never `{}`, `=~\".*\"`/`=~\".+\"`, or negative-only matchers), keep time ranges narrow, and check size with `query_loki_stats` first; rejected queries return rewrite guidance.",
 	queryLokiLogs,
 	mcp.WithTitleAnnotation("Query Loki logs"),
 	mcp.WithIdempotentHintAnnotation(true),
 	mcp.WithReadOnlyHintAnnotation(true),
+	mcp.WithDestructiveHintAnnotation(false),
+	mcp.WithOpenWorldHintAnnotation(false),
 )
 
 // fetchStats is a method to fetch stats data from Loki API
@@ -853,8 +932,8 @@ func (c *Client) fetchPatterns(ctx context.Context, query, startRFC3339, endRFC3
 type QueryLokiStatsParams struct {
 	DatasourceUID string `json:"datasourceUid" jsonschema:"required,description=The UID of the datasource to query"`
 	LogQL         string `json:"logql" jsonschema:"required,description=The LogQL matcher expression to execute. This parameter only accepts label matcher expressions and does not support full LogQL queries. Line filters\\, pattern operations\\, and metric aggregations are not supported by the stats API endpoint. Only simple label selectors can be used here."`
-	StartRFC3339  string `json:"startRfc3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format"`
-	EndRFC3339    string `json:"endRfc3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format"`
+	StartRFC3339  string `json:"startRfc3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format or relative time (e.g. 'now-1h')"`
+	EndRFC3339    string `json:"endRfc3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format or relative time (e.g. 'now')"`
 }
 
 // queryLokiStats queries stats from a Loki-compatible datasource. On
@@ -866,13 +945,13 @@ func queryLokiStats(ctx context.Context, args QueryLokiStatsParams) (*Stats, err
 	}
 
 	startTimeStr, endTimeStr := getDefaultTimeRange(args.StartRFC3339, args.EndRFC3339)
-	startTime, err := parseRFC3339OrZero(startTimeStr)
+	startTime, err := parseStartTime(startTimeStr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing start time: %w", err)
 	}
-	endTime, err := parseRFC3339OrZero(endTimeStr)
+	endTime, err := parseEndTime(endTimeStr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing end time: %w", err)
 	}
 
 	return backend.QueryStats(ctx, args.LogQL, startTime, endTime)
@@ -886,14 +965,16 @@ var QueryLokiStats = mcpgrafana.MustTool(
 	mcp.WithTitleAnnotation("Get Loki log statistics"),
 	mcp.WithIdempotentHintAnnotation(true),
 	mcp.WithReadOnlyHintAnnotation(true),
+	mcp.WithDestructiveHintAnnotation(false),
+	mcp.WithOpenWorldHintAnnotation(false),
 )
 
 // QueryLokiPatternsParams defines the parameters for querying Loki patterns
 type QueryLokiPatternsParams struct {
 	DatasourceUID string `json:"datasourceUid" jsonschema:"required,description=The UID of the datasource to query"`
 	LogQL         string `json:"logql" jsonschema:"required,description=A LogQL stream selector to identify the logs to analyze for patterns (e.g. {job=\"foo\"\\, namespace=\"bar\"})"`
-	StartRFC3339  string `json:"startRfc3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format (defaults to 1 hour ago)"`
-	EndRFC3339    string `json:"endRfc3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format (defaults to now)"`
+	StartRFC3339  string `json:"startRfc3339,omitempty" jsonschema:"description=Optionally\\, the start time of the query in RFC3339 format or relative time (e.g. 'now-1h') (defaults to 1 hour ago)"`
+	EndRFC3339    string `json:"endRfc3339,omitempty" jsonschema:"description=Optionally\\, the end time of the query in RFC3339 format or relative time (e.g. 'now') (defaults to now)"`
 	Step          string `json:"step,omitempty" jsonschema:"description=Optionally\\, the query resolution step (e.g. '5m')"`
 }
 
@@ -907,13 +988,13 @@ func queryLokiPatterns(ctx context.Context, args QueryLokiPatternsParams) ([]Pat
 	}
 
 	startTimeStr, endTimeStr := getDefaultTimeRange(args.StartRFC3339, args.EndRFC3339)
-	startTime, err := parseRFC3339OrZero(startTimeStr)
+	startTime, err := parseStartTime(startTimeStr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing start time: %w", err)
 	}
-	endTime, err := parseRFC3339OrZero(endTimeStr)
+	endTime, err := parseEndTime(endTimeStr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parsing end time: %w", err)
 	}
 
 	return backend.QueryPatterns(ctx, args.LogQL, args.Step, startTime, endTime)
@@ -927,16 +1008,25 @@ var QueryLokiPatterns = mcpgrafana.MustTool(
 	mcp.WithTitleAnnotation("Query Loki patterns"),
 	mcp.WithIdempotentHintAnnotation(true),
 	mcp.WithReadOnlyHintAnnotation(true),
+	mcp.WithDestructiveHintAnnotation(false),
+	mcp.WithOpenWorldHintAnnotation(false),
 )
 
 // AddLokiTools registers all Loki tools with the MCP server.
 // Config-generation tools (e.g. suggest_loki_alloy_label_config) live in
 // the separate "config" category — see tools.AddConfigTools.
-func AddLokiTools(mcp *server.MCPServer) {
+// The tools that return log content are registered only when enableQueryTools
+// is true. The metadata tools stay available either way, including
+// query_loki_stats and the label analyzer: both send a selector to the
+// datasource, but they read the index and return stream/chunk/byte counts, never
+// log lines.
+func AddLokiTools(mcp *server.MCPServer, enableQueryTools bool) {
 	ListLokiLabelNames.Register(mcp)
 	ListLokiLabelValues.Register(mcp)
 	QueryLokiStats.Register(mcp)
-	QueryLokiLogs.Register(mcp)
-	QueryLokiPatterns.Register(mcp)
+	if enableQueryTools {
+		QueryLokiLogs.Register(mcp)
+		QueryLokiPatterns.Register(mcp)
+	}
 	AddLokiLabelAnalyzerTools(mcp)
 }

@@ -8,7 +8,8 @@ keywords:
   - Tempo
   - datasource
 weight: 4
-aliases: []
+aliases:
+  - /docs/grafana-cloud/machine-learning/mcp/configure/proxied-tools/
 ---
 
 # Proxied tools
@@ -36,6 +37,8 @@ Tools appear as `tempo_<remote-tool-name>`. They are not listed in the static [M
 Proxied tools are enabled by default on this server. Pass `--disable-proxied` to disable them. The `proxied` token in `--enabled-tools` does not gate proxied tools; only `--disable-proxied` does. Omitting `proxied` from `--enabled-tools` does not disable them.
 
 With stdio transport, proxied tools are discovered once at startup. With SSE or streamable-http, discovery runs per MCP session when tools are listed or called.
+
+When [`--dynamic-multi-org`](../multi-organization-and-headers/) is enabled, discovery runs across every organization the credential can access (not just the default org), and proxied tools accept an optional `orgId` argument alongside `datasourceUid` to target a datasource in a specific organization.
 
 ## Next steps
 

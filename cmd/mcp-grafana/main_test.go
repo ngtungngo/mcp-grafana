@@ -1,19 +1,26 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os/exec"
 	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	mcpgrafana "github.com/grafana/mcp-grafana"
+	"github.com/grafana/mcp-grafana/observability"
+	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/grafana/mcp-grafana/observability"
 )
 
 // testClientSession implements server.ClientSession for unit tests.
@@ -39,7 +46,7 @@ func newTestObservability(t *testing.T) *observability.Observability {
 func TestNewServer_SessionIdleTimeoutZeroDisablesReaping(t *testing.T) {
 	obs := newTestObservability(t)
 	synctest.Test(t, func(t *testing.T) {
-		_, _, sm := newServer("stdio", disabledTools{enabledTools: "search"}, obs, 0)
+		_, _, sm := newServer(defaultServerName, "stdio", disabledTools{enabledTools: "search"}, obs, 0)
 		defer sm.Close()
 
 		session := &testClientSession{id: "should-persist"}
@@ -111,6 +118,139 @@ func TestBuildInstructions_ReflectsEnabledCategories(t *testing.T) {
 				"Available Capabilities:",
 			},
 		},
+		{
+			name:         "agento11y excluded unless opted in",
+			enabledTools: "search,datasource,incident,prometheus,loki,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,plugin,api,config,provisioning",
+			wantContains: []string{
+				"Search:",
+			},
+			wantNotContains: []string{
+				"Agent Observability:",
+			},
+		},
+		{
+			name:         "agento11y included when opted in",
+			enabledTools: "search,agento11y",
+			wantContains: []string{
+				"Agent Observability:",
+			},
+		},
+		{
+			name:         "agento11y disable flag overrides enabled list",
+			enabledTools: "search,agento11y",
+			disableFlags: map[string]bool{"agento11y": true},
+			wantContains: []string{
+				"Search:",
+			},
+			wantNotContains: []string{
+				"Agent Observability:",
+			},
+		},
+		{
+			name:         "assistant excluded unless opted in",
+			enabledTools: "search,datasource,incident,prometheus,loki,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,plugin,api,config,provisioning",
+			wantContains: []string{
+				"Search:",
+			},
+			wantNotContains: []string{
+				"Assistant:",
+			},
+		},
+		{
+			name:         "assistant included when opted in",
+			enabledTools: "search,assistant",
+			wantContains: []string{
+				"Assistant:",
+			},
+		},
+		{
+			name:         "assistant disable flag overrides enabled list",
+			enabledTools: "search,assistant",
+			disableFlags: map[string]bool{"assistant": true},
+			wantContains: []string{
+				"Search:",
+			},
+			wantNotContains: []string{
+				"Assistant:",
+			},
+		},
+		{
+			name:         "query-only categories excluded when query disabled",
+			enabledTools: "search,elasticsearch,quickwit,influxdb,runpanelquery",
+			disableFlags: map[string]bool{"query": true},
+			wantContains: []string{
+				"Search:",
+			},
+			wantNotContains: []string{
+				"Elasticsearch and OpenSearch:",
+				"Quickwit:",
+				"InfluxDB:",
+				"Run Panel Query:",
+			},
+		},
+		{
+			name:         "partially gated categories describe what remains when query disabled",
+			enabledTools: "prometheus,loki,clickhouse",
+			disableFlags: map[string]bool{"query": true},
+			wantContains: []string{
+				"Prometheus: Retrieve metric metadata",
+				"Loki: Retrieve log metadata",
+				"ClickHouse: List tables and describe table schemas",
+				"Query execution is disabled.",
+			},
+			wantNotContains: []string{
+				"Run PromQL queries",
+				"Run LogQL queries",
+			},
+		},
+		{
+			name:         "raw-SQL categories reflect read-only mode",
+			enabledTools: "clickhouse,influxdb,athena",
+			disableFlags: map[string]bool{"write": true},
+			wantContains: []string{
+				"ClickHouse: List tables and describe table schemas",
+				"Athena: Discover catalogs, databases, tables",
+				"Query execution is disabled.",
+			},
+			wantNotContains: []string{
+				"InfluxDB:",
+			},
+		},
+		{
+			name:         "raw-SQL categories restored by enable-query",
+			enabledTools: "clickhouse,influxdb,athena",
+			disableFlags: map[string]bool{"write": true, "enableQuery": true},
+			wantContains: []string{
+				"ClickHouse: Query ClickHouse datasources",
+				"InfluxDB:",
+				"Athena: Query Amazon Athena datasources",
+			},
+			wantNotContains: []string{
+				"Query execution is disabled.",
+			},
+		},
+		{
+			name:         "query categories described normally by default",
+			enabledTools: "prometheus,elasticsearch",
+			wantContains: []string{
+				"Run PromQL queries",
+				"Elasticsearch and OpenSearch:",
+			},
+			wantNotContains: []string{
+				"Query execution is disabled.",
+			},
+		},
+		{
+			name:         "assistant excluded when write disabled",
+			enabledTools: "search,assistant",
+			disableFlags: map[string]bool{"write": true},
+			wantContains: []string{
+				"Search:",
+			},
+			wantNotContains: []string{
+				"Assistant:",
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -125,6 +265,21 @@ func TestBuildInstructions_ReflectsEnabledCategories(t *testing.T) {
 				}
 				if tc.disableFlags["proxied"] {
 					dt.proxied = true
+				}
+				if tc.disableFlags["agento11y"] {
+					dt.agento11y = true
+				}
+				if tc.disableFlags["assistant"] {
+					dt.assistant = true
+				}
+				if tc.disableFlags["write"] {
+					dt.write = true
+				}
+				if tc.disableFlags["query"] {
+					dt.query = true
+				}
+				if tc.disableFlags["enableQuery"] {
+					dt.enableQuery = true
 				}
 			}
 
@@ -150,7 +305,7 @@ func TestBuildInstructions_TimestampNote(t *testing.T) {
 func TestNewServer_SessionIdleTimeoutCustomValue(t *testing.T) {
 	obs := newTestObservability(t)
 	synctest.Test(t, func(t *testing.T) {
-		_, _, sm := newServer("stdio", disabledTools{enabledTools: "search"}, obs, 1)
+		_, _, sm := newServer(defaultServerName, "stdio", disabledTools{enabledTools: "search"}, obs, 1)
 		defer sm.Close()
 
 		session := &testClientSession{id: "custom-ttl"}
@@ -305,5 +460,726 @@ func TestHandleFlagsPostParse(t *testing.T) {
 				assert.NoError(t, err, "expected no error")
 			}
 		})
+	}
+}
+
+// TestApplyLokiGuardrailEnv locks in the flag-over-env precedence: env vars
+// only fill in guardrail settings for flags not set on the command line,
+// including a flag explicitly set to its default value.
+func TestApplyLokiGuardrailEnv(t *testing.T) {
+	// Flag defaults as registered in addFlags.
+	defaults := grafanaConfig{
+		lokiGuardrailMode:     "off",
+		lokiGuardrailMaxBytes: 100 << 30,
+		lokiGuardrailMaxRange: 24 * time.Hour,
+	}
+
+	tests := []struct {
+		name          string
+		env           map[string]string
+		setFlags      map[string]bool
+		wantMode      string
+		wantMaxBytes  int64
+		wantMaxRange  time.Duration
+		wantErrSubstr string
+	}{
+		{
+			name: "env-only applies to all three settings",
+			env: map[string]string{
+				"GRAFANA_LOKI_GUARDRAIL_MODE":      "enforce",
+				"GRAFANA_LOKI_GUARDRAIL_MAX_BYTES": "1073741824",
+				"GRAFANA_LOKI_GUARDRAIL_MAX_RANGE": "6h",
+			},
+			wantMode:     "enforce",
+			wantMaxBytes: 1 << 30,
+			wantMaxRange: 6 * time.Hour,
+		},
+		{
+			name: "flag-set wins over env",
+			env: map[string]string{
+				"GRAFANA_LOKI_GUARDRAIL_MODE":      "enforce",
+				"GRAFANA_LOKI_GUARDRAIL_MAX_BYTES": "1073741824",
+				"GRAFANA_LOKI_GUARDRAIL_MAX_RANGE": "6h",
+			},
+			setFlags: map[string]bool{
+				"loki-guardrail-mode":      true,
+				"loki-guardrail-max-bytes": true,
+				"loki-guardrail-max-range": true,
+			},
+			// Values stay at the flag defaults: an explicit
+			// --loki-guardrail-mode=off must not be overridden by env even
+			// though it equals the default.
+			wantMode:     defaults.lokiGuardrailMode,
+			wantMaxBytes: defaults.lokiGuardrailMaxBytes,
+			wantMaxRange: defaults.lokiGuardrailMaxRange,
+		},
+		{
+			name: "flag-set is per setting",
+			env: map[string]string{
+				"GRAFANA_LOKI_GUARDRAIL_MODE":      "shadow",
+				"GRAFANA_LOKI_GUARDRAIL_MAX_RANGE": "6h",
+			},
+			setFlags:     map[string]bool{"loki-guardrail-max-range": true},
+			wantMode:     "shadow",
+			wantMaxBytes: defaults.lokiGuardrailMaxBytes,
+			wantMaxRange: defaults.lokiGuardrailMaxRange,
+		},
+		{
+			name:         "empty env ignored",
+			env:          map[string]string{"GRAFANA_LOKI_GUARDRAIL_MODE": ""},
+			wantMode:     defaults.lokiGuardrailMode,
+			wantMaxBytes: defaults.lokiGuardrailMaxBytes,
+			wantMaxRange: defaults.lokiGuardrailMaxRange,
+		},
+		{
+			name:          "invalid MAX_BYTES errors",
+			env:           map[string]string{"GRAFANA_LOKI_GUARDRAIL_MAX_BYTES": "10GiB"},
+			wantErrSubstr: "GRAFANA_LOKI_GUARDRAIL_MAX_BYTES",
+		},
+		{
+			name:          "invalid MAX_RANGE errors",
+			env:           map[string]string{"GRAFANA_LOKI_GUARDRAIL_MAX_RANGE": "1fortnight"},
+			wantErrSubstr: "GRAFANA_LOKI_GUARDRAIL_MAX_RANGE",
+		},
+	}
+
+	envVars := []string{
+		"GRAFANA_LOKI_GUARDRAIL_MODE",
+		"GRAFANA_LOKI_GUARDRAIL_MAX_BYTES",
+		"GRAFANA_LOKI_GUARDRAIL_MAX_RANGE",
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, k := range envVars {
+				t.Setenv(k, tc.env[k])
+			}
+			gc := defaults
+			err := gc.applyLokiGuardrailEnv(tc.setFlags)
+			if tc.wantErrSubstr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErrSubstr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantMode, gc.lokiGuardrailMode)
+			assert.Equal(t, tc.wantMaxBytes, gc.lokiGuardrailMaxBytes)
+			assert.Equal(t, tc.wantMaxRange, gc.lokiGuardrailMaxRange)
+		})
+	}
+}
+
+// TestValidateLokiGuardrail covers the startup validation extracted from
+// main: unknown modes and negative limits must be rejected.
+func TestValidateLokiGuardrail(t *testing.T) {
+	tests := []struct {
+		name          string
+		gc            grafanaConfig
+		wantErrSubstr string
+	}{
+		{name: "off is valid", gc: grafanaConfig{lokiGuardrailMode: "off"}},
+		{name: "shadow with limits is valid", gc: grafanaConfig{lokiGuardrailMode: "shadow", lokiGuardrailMaxBytes: 100 << 30, lokiGuardrailMaxRange: 24 * time.Hour}},
+		{name: "zero limits disable checks", gc: grafanaConfig{lokiGuardrailMode: "enforce"}},
+		{name: "unknown mode rejected", gc: grafanaConfig{lokiGuardrailMode: "Enforce"}, wantErrSubstr: "invalid Loki guardrail mode"},
+		{name: "negative max bytes rejected", gc: grafanaConfig{lokiGuardrailMode: "enforce", lokiGuardrailMaxBytes: -1}, wantErrSubstr: "GRAFANA_LOKI_GUARDRAIL_MAX_BYTES"},
+		{name: "negative max range rejected", gc: grafanaConfig{lokiGuardrailMode: "enforce", lokiGuardrailMaxRange: -time.Hour}, wantErrSubstr: "GRAFANA_LOKI_GUARDRAIL_MAX_RANGE"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.gc.validateLokiGuardrail()
+			if tc.wantErrSubstr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErrSubstr)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+func TestSplitAndTrim(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"empty string", "", nil},
+		{"single value", "a", []string{"a"}},
+		{"comma separated", "a,b,c", []string{"a", "b", "c"}},
+		{"whitespace trimmed", " a , b , c ", []string{"a", "b", "c"}},
+		{"empty entries skipped", "a,,b, ,c", []string{"a", "b", "c"}},
+		{"only commas yields nil", ",,, , ,", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, splitAndTrim(tc.in))
+		})
+	}
+}
+
+func TestHTTPSecurityConfigPolicy(t *testing.T) {
+	cases := []struct {
+		name           string
+		allowedHosts   string
+		allowedOrigins string
+		address        string
+		wantHosts      []string
+		wantOrigins    []string
+	}{
+		{
+			name:        "unset --allowed-hosts falls back to defaults",
+			address:     "localhost:8000",
+			wantHosts:   []string{"localhost:8000", "127.0.0.1:8000", "[::1]:8000"},
+			wantOrigins: nil,
+		},
+		{
+			// Regression guard: a malformed value that splits to empty must
+			// NOT silently disable Host validation.
+			name:         "comma-only --allowed-hosts falls back to defaults",
+			allowedHosts: ",,, ,",
+			address:      "localhost:8000",
+			wantHosts:    []string{"localhost:8000", "127.0.0.1:8000", "[::1]:8000"},
+			wantOrigins:  nil,
+		},
+		{
+			name:         "explicit --allowed-hosts overrides defaults",
+			allowedHosts: "mcp.example:8000, other.example:8000",
+			address:      "localhost:8000",
+			wantHosts:    []string{"mcp.example:8000", "other.example:8000"},
+		},
+		{
+			name:           "origins pass through",
+			allowedOrigins: "https://app.example",
+			address:        "localhost:8000",
+			wantHosts:      []string{"localhost:8000", "127.0.0.1:8000", "[::1]:8000"},
+			wantOrigins:    []string{"https://app.example"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hsc := httpSecurityConfig{allowedHosts: tc.allowedHosts, allowedOrigins: tc.allowedOrigins}
+			got := hsc.policy(tc.address)
+			assert.Equal(t, tc.wantHosts, got.AllowedHosts)
+			assert.Equal(t, tc.wantOrigins, got.AllowedOrigins)
+		})
+	}
+}
+
+// TestSSEServerSuppressesWildcardCORS pins the load-bearing assumption behind
+// corsOrigins(): that passing any non-empty AllowedOrigins through
+// WithSSECORS makes mcp-go's corsConfig.enabled() return true, suppressing
+// the historical Access-Control-Allow-Origin: * default on /sse.
+//
+// The control sub-test boots an SSE server without our opt-in and asserts the
+// wildcard IS emitted, documenting the regression scenario. If a future
+// mcp-go bump removes the historical default, the control fails and we know
+// the sentinel workaround can be removed.
+func TestSSEServerSuppressesWildcardCORS(t *testing.T) {
+	hitSSE := func(t *testing.T, opts ...server.SSEOption) http.Header {
+		t.Helper()
+		mcpServer := server.NewMCPServer("test", "0")
+		sse := server.NewSSEServer(mcpServer, opts...)
+		ts := httptest.NewServer(sse)
+		t.Cleanup(ts.Close)
+
+		// Abort as soon as we have headers — SSE keeps the stream open.
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/sse", nil)
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			require.NoError(t, err)
+		}
+		require.NotNil(t, resp)
+		t.Cleanup(func() { _ = resp.Body.Close() })
+		return resp.Header
+	}
+
+	t.Run("control: mcp-go emits the wildcard by default", func(t *testing.T) {
+		h := hitSSE(t)
+		assert.Equal(t, "*", h.Get("Access-Control-Allow-Origin"),
+			"mcp-go's historical default changed — sentinel workaround in corsOrigins() may be removable")
+	})
+
+	t.Run("opt-in via corsOrigins sentinel suppresses the wildcard", func(t *testing.T) {
+		hsc := httpSecurityConfig{}
+		h := hitSSE(t, server.WithSSECORS(server.WithCORSAllowedOrigins(hsc.corsOrigins()...)))
+		assert.Empty(t, h.Get("Access-Control-Allow-Origin"),
+			"sentinel did not suppress wildcard — mcp-go CORS contract may have changed")
+	})
+}
+
+func TestHTTPSecurityConfigCORSOrigins(t *testing.T) {
+	cases := []struct {
+		name           string
+		allowedOrigins string
+		want           []string
+	}{
+		{
+			// The sentinel keeps mcp-go's corsConfig.enabled() true so its
+			// SSE default of Access-Control-Allow-Origin: * is suppressed.
+			name: "unset returns the .invalid sentinel",
+			want: []string{"https://mcp-grafana.invalid"},
+		},
+		{
+			name:           "comma-only returns the sentinel",
+			allowedOrigins: ", ,",
+			want:           []string{"https://mcp-grafana.invalid"},
+		},
+		{
+			name:           "explicit origins pass through lowercased",
+			allowedOrigins: "HTTPS://App.Example, https://other.example",
+			want:           []string{"https://app.example", "https://other.example"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hsc := httpSecurityConfig{allowedOrigins: tc.allowedOrigins}
+			assert.Equal(t, tc.want, hsc.corsOrigins())
+		})
+	}
+}
+
+func getServerNameFromInitialize(t *testing.T, s *server.MCPServer) string {
+	t.Helper()
+	c, err := client.NewInProcessClient(s)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(context.Background()))
+	t.Cleanup(func() { _ = c.Close() })
+
+	result, err := c.Initialize(context.Background(), mcp.InitializeRequest{})
+	require.NoError(t, err)
+	return result.ServerInfo.Name
+}
+
+func TestResolveServerName(t *testing.T) {
+	tests := []struct {
+		name              string
+		flagValue         string
+		flagExplicitlySet bool
+		envValue          string
+		want              string
+	}{
+		{
+			name:              "no flag no env returns default",
+			flagValue:         defaultServerName,
+			flagExplicitlySet: false,
+			envValue:          "",
+			want:              defaultServerName,
+		},
+		{
+			name:              "flag set wins over nothing",
+			flagValue:         "my-custom-server",
+			flagExplicitlySet: true,
+			envValue:          "",
+			want:              "my-custom-server",
+		},
+		{
+			name:              "env set and flag not explicitly set returns env",
+			flagValue:         defaultServerName,
+			flagExplicitlySet: false,
+			envValue:          "env-server",
+			want:              "env-server",
+		},
+		{
+			name:              "both set flag wins",
+			flagValue:         "flag-server",
+			flagExplicitlySet: true,
+			envValue:          "env-server",
+			want:              "flag-server",
+		},
+		{
+			name:              "flag explicitly set to default overrides env",
+			flagValue:         defaultServerName,
+			flagExplicitlySet: true,
+			envValue:          "env-server",
+			want:              defaultServerName,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveServerName(tc.flagValue, tc.flagExplicitlySet, tc.envValue, defaultServerName)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestValidateServerName(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"default", "mcp-grafana", false},
+		{"typical multi-instance", "grafana-project-a", false},
+		{"dot-separated", "mcp-grafana.staging", false},
+		{"mixed case underscores digits", "My_Custom_Server_v2", false},
+		{"minimum length", "a", false},
+		{"maximum length", strings.Repeat("X", 128), false},
+		{"starts with letter then digits", "g123", false},
+		{"starts with digit", "1server", false},
+
+		{"empty string", "", true},
+		{"whitespace only", " ", true},
+		{"contains space", "my server", true},
+		{"contains tab", "name\t", true},
+		{"contains newline", "name\n", true},
+		{"starts with hyphen", "-starts-hyphen", true},
+		{"starts with dot", ".dotfile", true},
+		{"starts with underscore", "_leading_underscore", true},
+		{"non-ASCII unicode", "café-server", true},
+		{"cyrillic", "сервер", true},
+		{"ANSI escape", "name\x1b[31m", true},
+		{"null byte", "name\x00", true},
+		{"shell metacharacter semicolon", "server;rm -rf /", true},
+		{"shell command substitution", "$(whoami)", true},
+		{"forward slash", "name/path", true},
+		{"backslash", "name\\path", true},
+		{"colon", "name:colon", true},
+		{"zero-width character", "name\u200dzwj", true},
+		{"RTL override", "name\u202ertl", true},
+		{"exceeds max length", strings.Repeat("a", 129), true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateServerName(tc.input)
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestNewServer_DefaultServerName(t *testing.T) {
+	obs := newTestObservability(t)
+	s, _, sm := newServer(defaultServerName, "stdio", disabledTools{enabledTools: "search"}, obs, 0)
+	defer sm.Close()
+
+	name := getServerNameFromInitialize(t, s)
+	assert.Equal(t, "mcp-grafana", name)
+}
+
+func TestNewServer_CustomServerName(t *testing.T) {
+	obs := newTestObservability(t)
+	s, _, sm := newServer("my-custom-server", "stdio", disabledTools{enabledTools: "search"}, obs, 0)
+	defer sm.Close()
+
+	name := getServerNameFromInitialize(t, s)
+	assert.Equal(t, "my-custom-server", name)
+}
+
+func TestNewServer_MultiInstanceDistinctNames(t *testing.T) {
+	obs := newTestObservability(t)
+
+	sAlpha, _, smAlpha := newServer("instance-alpha", "stdio", disabledTools{enabledTools: "search"}, obs, 0)
+	defer smAlpha.Close()
+	sBeta, _, smBeta := newServer("instance-beta", "stdio", disabledTools{enabledTools: "search"}, obs, 0)
+	defer smBeta.Close()
+
+	nameAlpha := getServerNameFromInitialize(t, sAlpha)
+	nameBeta := getServerNameFromInitialize(t, sBeta)
+
+	assert.Equal(t, "instance-alpha", nameAlpha)
+	assert.Equal(t, "instance-beta", nameBeta)
+	assert.NotEqual(t, nameAlpha, nameBeta)
+}
+
+func TestCustomServerName_DoesNotAffectUserAgent(t *testing.T) {
+	obs := newTestObservability(t)
+	s, _, sm := newServer("my-custom-instance", "stdio", disabledTools{enabledTools: "search"}, obs, 0)
+	defer sm.Close()
+
+	name := getServerNameFromInitialize(t, s)
+	assert.Equal(t, "my-custom-instance", name)
+
+	ua := mcpgrafana.UserAgent()
+	assert.Contains(t, ua, "mcp-grafana/")
+	assert.NotContains(t, ua, "my-custom-instance")
+}
+
+func TestValidateServerName_ErrorMessages(t *testing.T) {
+	tests := []struct {
+		name           string
+		input          string
+		wantSubstrings []string
+	}{
+		{
+			name:           "empty string mentions empty",
+			input:          "",
+			wantSubstrings: []string{"must not be empty"},
+		},
+		{
+			name:           "too long mentions length",
+			input:          strings.Repeat("a", 129),
+			wantSubstrings: []string{"too long", "129", "128"},
+		},
+		{
+			name:           "invalid chars includes name and pattern",
+			input:          "my server",
+			wantSubstrings: []string{"my server", "invalid characters"},
+		},
+		{
+			name:           "leading hyphen includes name",
+			input:          "-bad",
+			wantSubstrings: []string{"-bad", "invalid characters"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateServerName(tc.input)
+			require.Error(t, err)
+			for _, sub := range tc.wantSubstrings {
+				assert.Contains(t, err.Error(), sub)
+			}
+		})
+	}
+}
+
+func TestCallerAuthConfigResolveToken(t *testing.T) {
+	t.Run("flag takes precedence and is trimmed", func(t *testing.T) {
+		t.Setenv(serverAuthTokenEnvVar, "from-env")
+		ca := callerAuthConfig{token: "  from-flag  "}
+		assert.Equal(t, "from-flag", ca.resolveToken())
+	})
+
+	t.Run("falls back to env when flag empty", func(t *testing.T) {
+		t.Setenv(serverAuthTokenEnvVar, "  from-env  ")
+		ca := callerAuthConfig{}
+		assert.Equal(t, "from-env", ca.resolveToken())
+	})
+
+	t.Run("empty when neither set", func(t *testing.T) {
+		t.Setenv(serverAuthTokenEnvVar, "")
+		ca := callerAuthConfig{}
+		assert.Empty(t, ca.resolveToken())
+	})
+}
+
+func TestCheckCallerAuthPolicy(t *testing.T) {
+	cases := []struct {
+		name      string
+		address   string
+		token     string
+		wantLevel string // "INFO" or "WARN"
+		wantMsg   string // substring expected in the emitted log line
+	}{
+		// A caller token authenticates every request, so any bind is fine.
+		{"token set, public bind", "0.0.0.0:8000", "tok", "INFO", "Caller authentication enabled"},
+		{"token set, loopback bind", "localhost:8000", "tok", "INFO", "Caller authentication enabled"},
+
+		// No token on a loopback bind: only local processes can connect, so this
+		// warns about the missing token rather than about public exposure.
+		{"no token, loopback", "127.0.0.1:8000", "", "WARN", "bound to a loopback address"},
+
+		// No token on a reachable bind: logged at ERROR (highest --log-level, so
+		// the exposure can't be filtered out); starts today (backward compatible).
+		{"no token, public bind", "0.0.0.0:8000", "", "ERROR", "startup error in a future release"},
+		{"no token, wildcard port", ":8000", "", "ERROR", "startup error in a future release"},
+		{"no token, routable IP", "192.168.1.5:8000", "", "ERROR", "startup error in a future release"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			checkCallerAuthPolicy("streamable-http", tc.address, tc.token, logger)
+			out := buf.String()
+			assert.Contains(t, out, tc.wantMsg)
+			assert.Contains(t, out, `"level":"`+tc.wantLevel+`"`)
+		})
+	}
+}
+
+// TestSOCKS5ProxyFromEnv locks in GRAFANA_SOCKS5_PROXY handling: unset or
+// empty leaves the proxy disabled, a valid URL is returned verbatim, and an
+// invalid URL is a startup error that does not leak the raw value (it may
+// contain proxy credentials).
+func TestSOCKS5ProxyFromEnv(t *testing.T) {
+	t.Run("unset env leaves proxy empty", func(t *testing.T) {
+		t.Setenv("GRAFANA_SOCKS5_PROXY", "")
+		raw, err := socks5ProxyFromEnv()
+		require.NoError(t, err)
+		assert.Empty(t, raw)
+	})
+
+	t.Run("valid URL is returned verbatim", func(t *testing.T) {
+		t.Setenv("GRAFANA_SOCKS5_PROXY", "socks5://127.0.0.1:1080")
+		raw, err := socks5ProxyFromEnv()
+		require.NoError(t, err)
+		assert.Equal(t, "socks5://127.0.0.1:1080", raw)
+	})
+
+	t.Run("invalid URL is an error naming the env var but not the value", func(t *testing.T) {
+		t.Setenv("GRAFANA_SOCKS5_PROXY", "http://user:secretpw@proxy.example.com:1080")
+		_, err := socks5ProxyFromEnv()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "GRAFANA_SOCKS5_PROXY")
+		assert.NotContains(t, err.Error(), "secretpw")
+	})
+}
+
+// safeQueryToolNames execute a query the query language cannot use to mutate
+// data. --disable-query removes them; --disable-write must not.
+var safeQueryToolNames = []string{
+	"query_prometheus",
+	"query_prometheus_histogram",
+	"query_loki_logs",
+	"query_loki_patterns",
+	"query_elasticsearch",
+	"query_quickwit",
+	"query_graphite",
+	"query_graphite_density",
+	"query_cloudwatch",
+	"query_pyroscope",
+	"run_panel_query",
+}
+
+// mutatingQueryToolNames pass raw SQL or InfluxQL through unfiltered, so they
+// can write when the datasource credentials permit it. Both --disable-query and
+// --disable-write remove them; --enable-query overrides the latter.
+var mutatingQueryToolNames = []string{
+	"query_clickhouse",
+	"query_snowflake",
+	"query_athena",
+	"query_influxdb",
+}
+
+// queryToolNames are every tool that executes a query against a datasource.
+var queryToolNames = append(append([]string{}, safeQueryToolNames...), mutatingQueryToolNames...)
+
+// metadataToolNames are discovery tools that live in the same categories as the
+// query tools and must survive --disable-query.
+var metadataToolNames = []string{
+	"list_prometheus_metric_names",
+	"list_prometheus_label_names",
+	"list_prometheus_label_values",
+	"list_prometheus_metric_metadata",
+	"list_loki_label_names",
+	"list_loki_label_values",
+	// Both send a selector to the datasource but read the index rather than
+	// returning log content, so query gating does not apply to them.
+	"query_loki_stats",
+	"analyze_loki_labels",
+	"list_clickhouse_tables",
+	"describe_clickhouse_table",
+	"list_snowflake_tables",
+	"describe_snowflake_table",
+	"list_athena_catalogs",
+	"list_athena_databases",
+	"list_athena_tables",
+	"describe_athena_table",
+	"list_graphite_metrics",
+	"list_graphite_tags",
+	"list_cloudwatch_namespaces",
+	"list_cloudwatch_metrics",
+	"list_cloudwatch_dimensions",
+	"list_pyroscope_label_names",
+	"list_pyroscope_label_values",
+	"list_pyroscope_profile_types",
+}
+
+// registerAllCategories registers every known tool category on a fresh server
+// and returns the set of advertised tool names.
+func registerAllCategories(t *testing.T, dt disabledTools) map[string]bool {
+	t.Helper()
+
+	categories := make([]string, 0, len(dt.toolEntries()))
+	for _, e := range dt.toolEntries() {
+		categories = append(categories, e.category)
+	}
+	dt.enabledTools = strings.Join(categories, ",")
+
+	srv := server.NewMCPServer("test", "0")
+	dt.processTools(srv)
+
+	response := srv.HandleMessage(context.Background(), []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	raw, err := json.Marshal(response)
+	require.NoError(t, err)
+
+	var listed struct {
+		Result struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &listed))
+
+	names := make(map[string]bool, len(listed.Result.Tools))
+	for _, tool := range listed.Result.Tools {
+		names[tool.Name] = true
+	}
+	return names
+}
+
+func TestProcessTools_QueryToolsRegisteredByDefault(t *testing.T) {
+	names := registerAllCategories(t, disabledTools{})
+	for _, name := range append(append([]string{}, queryToolNames...), metadataToolNames...) {
+		assert.True(t, names[name], "%s should be registered by default", name)
+	}
+}
+
+func TestProcessTools_DisableQueryRemovesOnlyQueryTools(t *testing.T) {
+	names := registerAllCategories(t, disabledTools{query: true})
+	for _, name := range queryToolNames {
+		assert.False(t, names[name], "%s should not be registered with --disable-query", name)
+	}
+	for _, name := range metadataToolNames {
+		assert.True(t, names[name], "%s should survive --disable-query", name)
+	}
+	// --disable-query is independent of --disable-write: write tools stay.
+	assert.True(t, names["update_dashboard"], "write tools should be unaffected by --disable-query")
+}
+
+func TestProcessTools_DisableWriteRemovesMutatingQueryTools(t *testing.T) {
+	names := registerAllCategories(t, disabledTools{write: true})
+	for _, name := range safeQueryToolNames {
+		assert.True(t, names[name], "%s cannot mutate data and should survive --disable-write", name)
+	}
+	for _, name := range mutatingQueryToolNames {
+		assert.False(t, names[name], "%s passes raw SQL through and should be gone with --disable-write", name)
+	}
+	assert.False(t, names["update_dashboard"], "write tools should be gone with --disable-write")
+	for _, name := range metadataToolNames {
+		assert.True(t, names[name], "%s should survive --disable-write", name)
+	}
+}
+
+func TestProcessTools_EnableQueryOverridesDisableWrite(t *testing.T) {
+	names := registerAllCategories(t, disabledTools{write: true, enableQuery: true})
+	for _, name := range queryToolNames {
+		assert.True(t, names[name], "%s should be restored by --enable-query", name)
+	}
+	// The override is scoped to query execution: real write tools stay gone.
+	assert.False(t, names["update_dashboard"], "--enable-query must not re-enable write tools")
+	assert.False(t, names["create_folder"], "--enable-query must not re-enable write tools")
+	assert.False(t, names["create_annotation"], "--enable-query must not re-enable write tools")
+}
+
+func TestProcessTools_EnableQueryAloneChangesNothing(t *testing.T) {
+	defaults := registerAllCategories(t, disabledTools{})
+	names := registerAllCategories(t, disabledTools{enableQuery: true})
+	assert.Equal(t, defaults, names, "--enable-query on its own should be a no-op")
+}
+
+func TestProcessTools_DisableQueryBeatsEnableQuery(t *testing.T) {
+	names := registerAllCategories(t, disabledTools{query: true, enableQuery: true})
+	for _, name := range queryToolNames {
+		assert.False(t, names[name], "%s should be gone: --disable-query wins over --enable-query", name)
+	}
+	for _, name := range metadataToolNames {
+		assert.True(t, names[name], "%s should survive --disable-query", name)
+	}
+}
+
+func TestProcessTools_BothDisableFlags(t *testing.T) {
+	names := registerAllCategories(t, disabledTools{write: true, query: true})
+	for _, name := range queryToolNames {
+		assert.False(t, names[name], "%s should be gone with both flags set", name)
+	}
+	assert.False(t, names["update_dashboard"], "write tools should be gone with both flags set")
+	for _, name := range metadataToolNames {
+		assert.True(t, names[name], "%s should survive both flags", name)
 	}
 }

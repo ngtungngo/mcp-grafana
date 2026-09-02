@@ -1,12 +1,9 @@
 package tools
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -27,7 +24,7 @@ type RunPanelQueryParams struct {
 	End            string            `json:"end" jsonschema:"description=Override end time (e.g. 'now'\\, RFC3339\\, Unix ms)"`
 	Variables      map[string]string `json:"variables" jsonschema:"description=Override dashboard variables (e.g. {\"job\": \"api-server\"})"`
 	DatasourceUID  string            `json:"datasourceUid,omitempty" jsonschema:"description=Override datasource UID"`
-	DatasourceType string            `json:"datasourceType,omitempty" jsonschema:"description=Override datasource type (prometheus\\, loki\\, grafana-clickhouse-datasource\\, cloudwatch\\, influxdb)"`
+	DatasourceType string            `json:"datasourceType,omitempty" jsonschema:"description=Override datasource type (prometheus\\, loki\\, grafana-clickhouse-datasource\\, cloudwatch\\, influxdb\\, grafana-bigquery-datasource\\, mssql\\, grafana-postgresql-datasource\\, postgres)"`
 }
 
 // QueryTimeRange represents the actual time range used for a panel query
@@ -156,12 +153,16 @@ func runSinglePanelQuery(ctx context.Context, params singlePanelQueryParams) (*P
 		return nil, fmt.Errorf("extracting panel info: %w", err)
 	}
 
-	// Extract template variables from dashboard
-	vars := extractTemplateVariables(params.DB)
+	// Extract template variables from the dashboard. Keep both the first value
+	// (used for datasource references) and the complete value list (used for
+	// formatted query interpolation).
+	templateVariables := extractTemplateVariableValues(params.DB)
+	vars := firstTemplateVariableValues(templateVariables)
 
 	// Apply variable overrides from user
 	for name, value := range params.Variables {
 		vars[name] = value
+		templateVariables[name] = []string{value}
 	}
 
 	// Resolve datasource UID and type
@@ -209,7 +210,7 @@ func runSinglePanelQuery(ctx context.Context, params singlePanelQueryParams) (*P
 	}
 
 	// Substitute variables in the query
-	query := substituteTemplateVariables(panelData.Query, vars)
+	query := substituteTemplateVariableValues(panelData.Query, templateVariables)
 
 	// Route to appropriate datasource and execute query
 	var results interface{}
@@ -222,11 +223,20 @@ func runSinglePanelQuery(ctx context.Context, params singlePanelQueryParams) (*P
 	case "clickhouse":
 		results, err = executeClickHouseQuery(ctx, datasourceUID, query, params.Start, params.End)
 	case "cloudwatch":
-		results, err = executeCloudWatchPanelQuery(ctx, datasourceUID, panelData, params.Start, params.End, vars)
+		results, err = executeCloudWatchPanelQuery(ctx, datasourceUID, panelData, params.Start, params.End, templateVariables)
 	case "influxdb":
 		results, err = executeInfluxDBQuery(ctx, datasourceUID, panelData, query, params.Start, params.End)
+	case "bigquery":
+		results, err = executeSQLPanelQuery(ctx, datasourceUID, panelData, query, params.Start, params.End, templateVariables, BigQueryDatasourceType)
+	case "mssql":
+		results, err = executeSQLPanelQuery(ctx, datasourceUID, panelData, query, params.Start, params.End, templateVariables, MSSQLDatasourceType)
+	case "postgres":
+		// PostgreSQL exposes two datasource identifiers (grafana-postgresql-datasource
+		// and the legacy postgres); pass the resolved type through so the datasource
+		// object sent to Grafana matches what the panel actually declared.
+		results, err = executeSQLPanelQuery(ctx, datasourceUID, panelData, query, params.Start, params.End, templateVariables, datasourceType)
 	default:
-		results, err = executeGenericPanelQuery(ctx, datasourceType, datasourceUID, panelData, params.Start, params.End, vars)
+		results, err = executeGenericPanelQuery(ctx, datasourceType, datasourceUID, panelData, params.Start, params.End, templateVariables)
 	}
 
 	if err != nil {
@@ -250,8 +260,13 @@ func runSinglePanelQuery(ctx context.Context, params singlePanelQueryParams) (*P
 	}, nil
 }
 
-func executeGenericPanelQuery(ctx context.Context, datasourceType, datasourceUID string, panelData *panelInfo, start, end string, variables map[string]string) (interface{}, error) {
-	if panelData.RawTarget == nil {
+// executeGenericPanelQuery runs a panel target against a datasource that has no
+// dedicated execution path here, by forwarding the panel's raw target to Grafana's
+// /api/ds/query endpoint. Only datasource and refId are overridden, so
+// datasource-specific query fields (a Neo4j cypherQuery, for example) reach the
+// backend plugin untouched.
+func executeGenericPanelQuery(ctx context.Context, datasourceType, datasourceUID string, panelData *panelInfo, start, end string, variables templateVariableValues) (interface{}, error) {
+	if panelData == nil || panelData.RawTarget == nil {
 		return nil, fmt.Errorf("panel target not available")
 	}
 
@@ -265,8 +280,8 @@ func executeGenericPanelQuery(ctx context.Context, datasourceType, datasourceUID
 		return nil, fmt.Errorf("parsing end time: %w", err)
 	}
 
-	// Deep copy and substitute variables in target fields
-	target := substituteTemplateVariablesInMap(panelData.RawTarget, variables)
+	// Deep copy the raw target and substitute variables in its fields.
+	target := substituteTemplateVariablesInMapWithValues(panelData.RawTarget, variables)
 
 	// Ensure datasource is set correctly
 	target["datasource"] = map[string]interface{}{"uid": datasourceUID, "type": datasourceType}
@@ -276,45 +291,100 @@ func executeGenericPanelQuery(ctx context.Context, datasourceType, datasourceUID
 		target["refId"] = "A"
 	}
 
-	// Build /api/ds/query payload
-	payload := map[string]interface{}{
-		"queries": []map[string]interface{}{target},
-		"from":    fmt.Sprintf("%d", startTime.UnixMilli()),
-		"to":      fmt.Sprintf("%d", endTime.UnixMilli()),
-	}
-
-	return executeGrafanaDSQuery(ctx, payload)
+	return executeGrafanaDSQuery(ctx, dsQueryPayload(startTime, endTime, target))
 }
 
-// substituteTemplateVariables replaces template variables in a query string
-// Supports ${varname}, [[varname]], and $varname (with word boundary) patterns
-func substituteTemplateVariables(query string, variables map[string]string) string {
-	if variables == nil {
-		return query
-	}
-	for name, value := range variables {
-		// Replace ${varname}
-		query = strings.ReplaceAll(query, "${"+name+"}", value)
-		// Replace [[varname]]
-		query = strings.ReplaceAll(query, "[["+name+"]]", value)
-		// Replace $varname with word boundary to avoid partial matches
-		varRe := regexp.MustCompile(fmt.Sprintf(`\$%s\b`, regexp.QuoteMeta(name)))
-		query = varRe.ReplaceAllLiteralString(query, value)
+type templateVariableValues map[string][]string
+
+// substituteTemplateVariableValues interpolates variables while retaining
+// multi-select values for formatters such as sqlstring. Explicitly supported
+// formatters follow Grafana's formatting syntax; unknown formatters fall back
+// to Grafana's glob representation.
+func substituteTemplateVariableValues(query string, variables templateVariableValues) string {
+	for name, values := range variables {
+		variableRe := regexp.MustCompile(fmt.Sprintf(
+			`\$\{%s(?::[^}]*)?\}|\[\[%s(?::[^\]]*)?\]\]|\$%s\b`,
+			regexp.QuoteMeta(name), regexp.QuoteMeta(name), regexp.QuoteMeta(name),
+		))
+		query = variableRe.ReplaceAllStringFunc(query, func(match string) string {
+			format, hasFormat := templateVariableFormat(match)
+			if !hasFormat {
+				return firstTemplateVariableValue(values)
+			}
+			return formatTemplateVariable(values, format)
+		})
 	}
 	return query
 }
 
-// substituteTemplateVariablesInMap recursively substitutes variables in a map's string values
-func substituteTemplateVariablesInMap(target map[string]interface{}, variables map[string]string) map[string]interface{} {
+func templateVariableFormat(match string) (string, bool) {
+	var inner string
+	switch {
+	case strings.HasPrefix(match, "${") && strings.HasSuffix(match, "}"):
+		inner = match[2 : len(match)-1]
+	case strings.HasPrefix(match, "[[") && strings.HasSuffix(match, "]]"):
+		inner = match[2 : len(match)-2]
+	default:
+		return "", false
+	}
+
+	separator := strings.IndexByte(inner, ':')
+	if separator < 0 {
+		return "", false
+	}
+	return inner[separator+1:], true
+}
+
+func firstTemplateVariableValue(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+func formatTemplateVariable(values []string, format string) string {
+	formatName := format
+	if separator := strings.IndexByte(format, ':'); separator >= 0 {
+		formatName = format[:separator]
+	}
+
+	if formatName == "sqlstring" {
+		return formatSQLStringVariable(values)
+	}
+
+	// Grafana uses glob as the fallback for unknown formatting options.
+	if len(values) > 1 {
+		return "{" + strings.Join(values, ",") + "}"
+	}
+	return firstTemplateVariableValue(values)
+}
+
+func formatSQLStringVariable(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+
+	formatted := make([]string, len(values))
+	for i, value := range values {
+		// Match Grafana's SQLString formatter: pair single quotes and escape
+		// double quotes with a backslash before surrounding the value in quotes.
+		value = strings.ReplaceAll(value, "'", "''")
+		value = strings.ReplaceAll(value, `"`, `\"`)
+		formatted[i] = "'" + value + "'"
+	}
+	return strings.Join(formatted, ",")
+}
+
+func substituteTemplateVariablesInMapWithValues(target map[string]interface{}, variables templateVariableValues) map[string]interface{} {
 	result := make(map[string]interface{})
 	for k, v := range target {
 		switch val := v.(type) {
 		case string:
-			result[k] = substituteTemplateVariables(val, variables)
+			result[k] = substituteTemplateVariableValues(val, variables)
 		case map[string]interface{}:
-			result[k] = substituteTemplateVariablesInMap(val, variables)
+			result[k] = substituteTemplateVariablesInMapWithValues(val, variables)
 		case []interface{}:
-			result[k] = substituteTemplateVariablesInSlice(val, variables)
+			result[k] = substituteTemplateVariablesInSliceWithValues(val, variables)
 		default:
 			result[k] = v
 		}
@@ -322,17 +392,16 @@ func substituteTemplateVariablesInMap(target map[string]interface{}, variables m
 	return result
 }
 
-// substituteTemplateVariablesInSlice recursively substitutes variables in a slice
-func substituteTemplateVariablesInSlice(slice []interface{}, variables map[string]string) []interface{} {
+func substituteTemplateVariablesInSliceWithValues(slice []interface{}, variables templateVariableValues) []interface{} {
 	result := make([]interface{}, len(slice))
 	for i, v := range slice {
 		switch val := v.(type) {
 		case string:
-			result[i] = substituteTemplateVariables(val, variables)
+			result[i] = substituteTemplateVariableValues(val, variables)
 		case map[string]interface{}:
-			result[i] = substituteTemplateVariablesInMap(val, variables)
+			result[i] = substituteTemplateVariablesInMapWithValues(val, variables)
 		case []interface{}:
-			result[i] = substituteTemplateVariablesInSlice(val, variables)
+			result[i] = substituteTemplateVariablesInSliceWithValues(val, variables)
 		default:
 			result[i] = v
 		}
@@ -391,16 +460,18 @@ func extractPanelInfo(panel map[string]interface{}, queryIndex int) (*panelInfo,
 
 	// CloudWatch panels use structured targets rather than string expressions
 	if query == "" && normalizeDatasourceType(info.DatasourceType) != "cloudwatch" {
-		return nil, fmt.Errorf("could not extract query from panel target (checked: expr, query, expression, rawSql, rawQuery)")
+		return nil, fmt.Errorf("could not extract query from panel target (checked: expr, query, expression, rawSql, rawSQL, rawQuery, target)")
 	}
 	info.Query = query
 
 	return info, nil
 }
 
-// extractTemplateVariables extracts template variables and their current values from dashboard
-func extractTemplateVariables(db map[string]interface{}) map[string]string {
-	variables := make(map[string]string)
+// extractTemplateVariableValues extracts all selected values of each dashboard
+// template variable. Grafana stores multi-select values in current.value as an
+// array, and formatted interpolation needs to retain that array.
+func extractTemplateVariableValues(db map[string]interface{}) templateVariableValues {
+	variables := make(templateVariableValues)
 
 	templating := safeObject(db, "templating")
 	if templating == nil {
@@ -421,32 +492,71 @@ func extractTemplateVariables(db map[string]interface{}) map[string]string {
 
 		// Get current value - can be in different formats
 		current := safeObject(variable, "current")
+		currentValueSet := false
 		if current != nil {
-			// Try "value" field first (can be string or array)
+			// Try "value" field first (can be string or array).
 			if val, ok := current["value"]; ok {
+				currentValueSet = true
 				switch v := val.(type) {
 				case string:
 					if v != "$__all" {
-						variables[name] = v
+						variables[name] = []string{v}
 					}
+				case nil:
+					// Grafana formats a defined null/undefined value as an empty
+					// string. Keep the empty slice distinguishable from a missing
+					// variable so formatted expressions are still replaced.
+					variables[name] = []string{}
 				case []interface{}:
-					// Multi-value - take first value for simplicity
-					if len(v) > 0 {
-						if str, ok := v[0].(string); ok && str != "$__all" {
-							variables[name] = str
+					if len(v) == 0 {
+						variables[name] = []string{}
+					} else if first, ok := v[0].(string); ok && first != "$__all" {
+						values := make([]string, 0, len(v))
+						for _, item := range v {
+							if str, ok := item.(string); ok {
+								values = append(values, str)
+							}
 						}
+						variables[name] = values
+					}
+				case []string:
+					if len(v) == 0 || v[0] != "$__all" {
+						variables[name] = append([]string(nil), v...)
 					}
 				}
 			}
 			// Fall back to "text" field
-			if variables[name] == "" {
+			if !currentValueSet {
 				if text, ok := current["text"].(string); ok && text != "" && text != "All" {
-					variables[name] = text
+					variables[name] = []string{text}
+				}
+			}
+		}
+
+		// Constant and textbox variables hold their value in "query" and are
+		// frequently saved without a "current" at all. Without this fallback
+		// the raw $name survives substitution and reaches the datasource,
+		// which for SQL datasources is a syntax error.
+		if !currentValueSet {
+			switch safeString(variable, "type") {
+			case "constant", "textbox":
+				if q := safeString(variable, "query"); q != "" {
+					variables[name] = []string{q}
 				}
 			}
 		}
 	}
 
+	return variables
+}
+
+func firstTemplateVariableValues(values templateVariableValues) map[string]string {
+	variables := make(map[string]string, len(values))
+	for name, value := range values {
+		if len(value) > 0 {
+			variables[name] = value[0]
+		}
+	}
 	return variables
 }
 
@@ -518,7 +628,7 @@ func executeClickHouseQuery(ctx context.Context, datasourceUID, query, start, en
 }
 
 // executeCloudWatchPanelQuery runs a CloudWatch query using Grafana's /api/ds/query endpoint
-func executeCloudWatchPanelQuery(ctx context.Context, datasourceUID string, panelData *panelInfo, start, end string, variables map[string]string) (interface{}, error) {
+func executeCloudWatchPanelQuery(ctx context.Context, datasourceUID string, panelData *panelInfo, start, end string, variables templateVariableValues) (interface{}, error) {
 	if panelData.RawTarget == nil {
 		return nil, fmt.Errorf("CloudWatch panel target not available")
 	}
@@ -541,7 +651,7 @@ func executeCloudWatchPanelQuery(ctx context.Context, datasourceUID string, pane
 	}
 
 	// Deep copy and substitute variables in target fields
-	target := substituteTemplateVariablesInMap(panelData.RawTarget, variables)
+	target := substituteTemplateVariablesInMapWithValues(panelData.RawTarget, variables)
 
 	// Ensure datasource is set correctly
 	target["datasource"] = map[string]interface{}{"uid": datasourceUID, "type": "cloudwatch"}
@@ -551,14 +661,7 @@ func executeCloudWatchPanelQuery(ctx context.Context, datasourceUID string, pane
 		target["refId"] = "A"
 	}
 
-	// Build /api/ds/query payload
-	payload := map[string]interface{}{
-		"queries": []map[string]interface{}{target},
-		"from":    fmt.Sprintf("%d", startTime.UnixMilli()),
-		"to":      fmt.Sprintf("%d", endTime.UnixMilli()),
-	}
-
-	return executeGrafanaDSQuery(ctx, payload)
+	return executeGrafanaDSQuery(ctx, dsQueryPayload(startTime, endTime, target))
 }
 
 // executeInfluxDBQuery runs an InfluxDB panel query using queryInfluxDB. The
@@ -581,65 +684,121 @@ func executeInfluxDBQuery(ctx context.Context, datasourceUID string, panelData *
 	})
 }
 
-// executeGrafanaDSQuery executes a query through Grafana's /api/ds/query endpoint
+// BigQueryDatasourceType is the type identifier for BigQuery datasources.
+const BigQueryDatasourceType = "grafana-bigquery-datasource"
+
+// MSSQLDatasourceType is the type identifier for Microsoft SQL Server datasources.
+const MSSQLDatasourceType = "mssql"
+
+// PostgresDatasourceType is the modern type identifier for PostgreSQL datasources.
+const PostgresDatasourceType = "grafana-postgresql-datasource"
+
+// PostgresLegacyDatasourceType is the legacy identifier that older and provisioned
+// Grafana installations still expose for the same PostgreSQL datasource.
+const PostgresLegacyDatasourceType = "postgres"
+
+// SQLFormatTable is the format value for table/tabular query results on sqlds-based
+// datasources such as BigQuery, whose query model takes a numeric format enum.
+const SQLFormatTable = 1
+
+// MSSQLFormatTable is the format value for table/tabular query results on MSSQL, whose
+// sqleng-based query model unmarshals format into a string and fails on a number.
+const MSSQLFormatTable = "table"
+
+// defaultSQLFormat returns the table format value understood by the given datasource.
+func defaultSQLFormat(datasourceType string) interface{} {
+	switch normalizeDatasourceType(datasourceType) {
+	case "mssql", "postgres":
+		// MSSQL and PostgreSQL both use Grafana's sqleng backend, whose query model
+		// unmarshals format into a string and errors on a number.
+		return MSSQLFormatTable
+	default:
+		return SQLFormatTable
+	}
+}
+
+// SQLQueryResult represents the tabular result of a SQL panel query.
+type SQLQueryResult struct {
+	Columns        []string                 `json:"columns"`
+	Rows           []map[string]interface{} `json:"rows"`
+	RowCount       int                      `json:"rowCount"`
+	ProcessedQuery string                   `json:"processedQuery,omitempty"`
+}
+
+// executeSQLPanelQuery runs a panel query against a SQL datasource via Grafana's
+// /api/ds/query endpoint. Those datasources resolve SQL macros such as
+// $__timeFilter/$__timeFrom/$__timeGroup server-side in their backend plugin, so we
+// only substitute the frontend-only macros ($__interval, $__range, etc.) here. The
+// panel's raw target is preserved so datasource-specific fields (BigQuery's location,
+// project and dataset, for example) reach the backend; only rawSql, datasource, refId
+// and format are overridden.
+func executeSQLPanelQuery(ctx context.Context, datasourceUID string, panelData *panelInfo, query, start, end string, variables templateVariableValues, datasourceType string) (*SQLQueryResult, error) {
+	if panelData == nil || panelData.RawTarget == nil {
+		return nil, fmt.Errorf("SQL panel target not available")
+	}
+
+	// Parse time range
+	startTime, err := parseTime(start)
+	if err != nil {
+		return nil, fmt.Errorf("parsing start time: %w", err)
+	}
+	endTime, err := parseTime(end)
+	if err != nil {
+		return nil, fmt.Errorf("parsing end time: %w", err)
+	}
+
+	// Substitute Grafana frontend macros; leave SQL macros for the backend plugin.
+	processedQuery := substituteGrafanaMacros(query, startTime, endTime)
+
+	// Deep copy the raw target and substitute variables in its fields (e.g. location).
+	target := substituteTemplateVariablesInMapWithValues(panelData.RawTarget, variables)
+
+	// Override the SQL with the fully-processed query and ensure required fields are set.
+	target["rawSql"] = processedQuery
+	target["datasource"] = map[string]interface{}{"uid": datasourceUID, "type": datasourceType}
+	if safeString(target, "refId") == "" {
+		target["refId"] = "A"
+	}
+	if _, ok := target["format"]; !ok {
+		target["format"] = defaultSQLFormat(datasourceType)
+	}
+
+	client, baseURL, err := newDSQueryHTTPClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := doDSQuery(ctx, client, baseURL, dsQueryPayload(startTime, endTime, target))
+	if err != nil {
+		return nil, err
+	}
+
+	columns, rows, err := framesToTabularRows(resp)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SQLQueryResult{
+		Columns:        columns,
+		Rows:           rows,
+		RowCount:       len(rows),
+		ProcessedQuery: processedQuery,
+	}, nil
+}
+
+// executeGrafanaDSQuery executes a query through Grafana's /api/ds/query endpoint.
 func executeGrafanaDSQuery(ctx context.Context, payload map[string]interface{}) (interface{}, error) {
-	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
-	baseURL := cfg.URL
-
-	transport, err := mcpgrafana.BuildTransport(&cfg, nil)
+	client, baseURL, err := newDSQueryHTTPClient(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create transport: %w", err)
+		return nil, err
 	}
 
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second,
-	}
-
-	payloadBytes, err := json.Marshal(payload)
+	resp, err := doDSQuery(ctx, client, baseURL, payload)
 	if err != nil {
-		return nil, fmt.Errorf("marshaling query payload: %w", err)
+		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/api/ds/query", bytes.NewReader(payloadBytes))
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("executing query: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	bodyBytes, err := readResponseBody(resp.Body, defaultResponseLimitBytes)
-	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		// Try to extract error message from JSON response
-		var errResult map[string]interface{}
-		if json.Unmarshal(bodyBytes, &errResult) == nil {
-			if errMsg, ok := errResult["message"].(string); ok {
-				return nil, fmt.Errorf("query failed: %s", errMsg)
-			}
-		}
-		return nil, fmt.Errorf("query failed with status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &result); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
-	}
-
-	// Return the results from the response
-	if results, ok := result["results"].(map[string]interface{}); ok {
-		return results, nil
-	}
-
-	return result, nil
+	return resp.Responses, nil
 }
 
 // substituteGrafanaMacros substitutes Grafana temporal macros ($__range, $__rate_interval, $__interval)
@@ -754,6 +913,12 @@ func normalizeDatasourceType(dsType string) string {
 		return "influxdb"
 	case strings.Contains(lower, "clickhouse"):
 		return "clickhouse"
+	case lower == "mssql":
+		return "mssql"
+	case lower == "postgres" || lower == "grafana-postgresql-datasource":
+		return "postgres"
+	case strings.Contains(lower, "bigquery"):
+		return "bigquery"
 	default:
 		return lower
 	}
@@ -772,6 +937,8 @@ func isEmptyPanelResult(results interface{}) bool {
 	case *ClickHouseQueryResult:
 		return v == nil || len(v.Rows) == 0
 	case *InfluxDBQueryResult:
+		return v == nil || len(v.Rows) == 0
+	case *SQLQueryResult:
 		return v == nil || len(v.Rows) == 0
 	case model.Value:
 		switch m := v.(type) {
@@ -823,6 +990,27 @@ func generatePanelQueryHints(datasourceType, query string) []string {
 			"- Tag filters may be too restrictive - remove them to see if the measurement has any points",
 			"- InfluxDB retention policy may have expired the data - check the bucket's retention settings",
 		)
+	case "bigquery":
+		hints = append(hints,
+			"- Table or dataset may be empty for this time range - try a COUNT(*) without the time filter to verify",
+			"- Column names or WHERE clause may not match the schema - check the table definition in BigQuery",
+			"- The $__timeFilter(column) macro may reference a column whose type or timezone doesn't match the time range",
+			"- The datasource's processing location may not match the dataset's region",
+		)
+	case "mssql":
+		hints = append(hints,
+			"- Table may be empty for this time range - try a COUNT(*) without the time filter to verify",
+			"- Column names or WHERE clause may not match the schema - check the table definition in SQL Server",
+			"- The $__timeFilter(column) macro may reference a column whose type or timezone doesn't match the time range",
+			"- The datasource login may lack SELECT permission on the referenced tables",
+		)
+	case "postgres":
+		hints = append(hints,
+			"- Table may be empty for this time range - try a COUNT(*) without the time filter to verify",
+			"- Column names or WHERE clause may not match the schema - check the table definition in PostgreSQL",
+			"- The $__timeFilter(column) macro may reference a column whose type or timezone doesn't match the time range",
+			"- The datasource role may lack SELECT privilege on the referenced tables, or the schema may not be on the search_path",
+		)
 	}
 
 	if query != "" {
@@ -843,14 +1031,20 @@ func truncateString(s string, maxLen int) string {
 // RunPanelQuery is the tool definition for running panel queries
 var RunPanelQuery = mcpgrafana.MustTool(
 	"run_panel_query",
-	"Executes one or more dashboard panel queries with optional time range and variable overrides. Accepts an array of panel IDs to query in a single call. Fetches the dashboard\\, extracts queries from the specified panels\\, substitutes template variables and Grafana macros ($__range\\, $__rate_interval\\, $__interval)\\, and routes to the appropriate datasource (e.g. Prometheus\\, Loki\\, ClickHouse\\, CloudWatch\\, InfluxDB). Returns results keyed by panel ID - partial failures are allowed (some panels can succeed while others fail). Use get_dashboard_summary first to find panel IDs. If a panel uses a template variable datasource you cannot access\\, provide datasourceUid and datasourceType to override.",
+	"Executes one or more dashboard panel queries with optional time range and variable overrides. Accepts an array of panel IDs to query in a single call. Fetches the dashboard\\, extracts queries from the specified panels\\, substitutes template variables and Grafana macros ($__range\\, $__rate_interval\\, $__interval)\\, and routes to the appropriate datasource - Prometheus\\, Loki\\, ClickHouse\\, CloudWatch\\, InfluxDB\\, BigQuery\\, MSSQL and PostgreSQL have dedicated support\\, any other datasource type is queried generically through Grafana's datasource query API. Returns results keyed by panel ID - partial failures are allowed (some panels can succeed while others fail). Use get_dashboard_summary first to find panel IDs. If a panel uses a template variable datasource you cannot access\\, provide datasourceUid and datasourceType to override.",
 	runPanelQuery,
 	mcp.WithTitleAnnotation("Run panel query"),
 	mcp.WithIdempotentHintAnnotation(true),
 	mcp.WithReadOnlyHintAnnotation(true),
+	mcp.WithDestructiveHintAnnotation(false),
+	mcp.WithOpenWorldHintAnnotation(false),
 )
 
-// AddRunPanelQueryTools registers run panel query tools with the MCP server
-func AddRunPanelQueryTools(mcp *server.MCPServer) {
-	RunPanelQuery.Register(mcp)
+// AddRunPanelQueryTools registers run panel query tools with the MCP server.
+// Every tool in this category executes a query, so nothing is registered when
+// enableQueryTools is false.
+func AddRunPanelQueryTools(mcp *server.MCPServer, enableQueryTools bool) {
+	if enableQueryTools {
+		RunPanelQuery.Register(mcp)
+	}
 }

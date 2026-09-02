@@ -1,9 +1,7 @@
 package tools
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,8 +19,10 @@ import (
 // promBackend abstracts the differences between datasource types that support
 // PromQL-compatible queries (native Prometheus, Cloud Monitoring, etc.).
 type promBackend interface {
-	// Query executes a PromQL query (instant or range) and returns the result.
-	Query(ctx context.Context, expr string, queryType string, start, end time.Time, stepSeconds int) (model.Value, error)
+	// Query executes a PromQL query (instant or range) and returns the result
+	// along with any warnings the datasource reported (e.g. partial responses
+	// from a Thanos store).
+	Query(ctx context.Context, expr string, queryType string, start, end time.Time, stepSeconds int) (model.Value, promv1.Warnings, error)
 
 	// LabelNames returns label names, optionally filtered by matchers and time range.
 	LabelNames(ctx context.Context, matchers []string, start, end time.Time) ([]string, error)
@@ -53,6 +53,8 @@ func backendForDatasource(ctx context.Context, uid string, projectOverride ...st
 		return newCloudMonitoringBackend(ctx, ds, proj)
 	case victoriaMetricsDatasourceType:
 		return newVictoriaMetricsBackend(ctx, uid, ds)
+	case "tempo":
+		return nil, fmt.Errorf("datasource %s is of type %q, which is not a supported Prometheus-compatible datasource", uid, ds.Type)
 	default:
 		// For prometheus, thanos, cortex, mimir, and any other Prometheus-compatible datasource,
 		// use the native Prometheus client via the datasource proxy.
@@ -70,7 +72,21 @@ func newPrometheusBackend(ctx context.Context, uid string, ds *models.DataSource
 	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
 	grafanaURL := trimTrailingSlash(cfg.URL)
 	resourcesBase, proxyBase := datasourceProxyPaths(uid)
-	url := grafanaURL + resourcesBase
+	primaryBase, fallbackBase := resourcesBase, proxyBase
+	legacyMode := false
+	if numericBase, uidBase, ok := fallbackProxyBases(ctx, uid); ok {
+		// The datasource was resolved through the frontend-settings fallback,
+		// meaning this deployment's metadata API is inaccessible — in practice
+		// Grafana before 9.0, which has no uid-based routes at all (8.x answers
+		// them with a 400 "id is invalid", 7.x with a 500). Route through the
+		// numeric-id proxy path directly, keeping the uid-based proxy route
+		// only as the transport-level fallback for the opposite case: a newer
+		// Grafana with an RBAC-restricted token, where the numeric routes may
+		// be disabled (404, off by default since Grafana 13).
+		primaryBase, fallbackBase = numericBase, uidBase
+		legacyMode = true
+	}
+	url := grafanaURL + primaryBase
 
 	rt, err := mcpgrafana.BuildTransport(&cfg, api.DefaultRoundTripper)
 	if err != nil {
@@ -88,9 +104,14 @@ func newPrometheusBackend(ctx context.Context, uid string, ds *models.DataSource
 		}
 	}
 
-	// Wrap with fallback transport: try /resources first, fall back to /proxy
-	// on 403/500 for compatibility with different managed Grafana deployments.
-	rt = newDatasourceFallbackTransport(rt, resourcesBase, proxyBase)
+	// Wrap with fallback transport: try the primary base first, fall back to
+	// the alternate for compatibility with different Grafana deployments (see
+	// fallback_transport.go for the per-mode retry rules).
+	if legacyMode {
+		rt = newLegacyDatasourceFallbackTransport(rt, primaryBase, fallbackBase)
+	} else {
+		rt = newDatasourceFallbackTransport(rt, primaryBase, fallbackBase)
+	}
 
 	c, err := api.NewClient(api.Config{
 		Address:      url,
@@ -103,27 +124,27 @@ func newPrometheusBackend(ctx context.Context, uid string, ds *models.DataSource
 	return &prometheusBackend{api: promv1.NewAPI(c)}, nil
 }
 
-func (b *prometheusBackend) Query(ctx context.Context, expr string, queryType string, start, end time.Time, stepSeconds int) (model.Value, error) {
+func (b *prometheusBackend) Query(ctx context.Context, expr string, queryType string, start, end time.Time, stepSeconds int) (model.Value, promv1.Warnings, error) {
 	switch queryType {
 	case "range":
 		step := time.Duration(stepSeconds) * time.Second
-		result, _, err := b.api.QueryRange(ctx, expr, promv1.Range{
+		result, warnings, err := b.api.QueryRange(ctx, expr, promv1.Range{
 			Start: start,
 			End:   end,
 			Step:  step,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("querying Prometheus range: %w", err)
+			return nil, nil, fmt.Errorf("querying Prometheus range: %w", err)
 		}
-		return result, nil
+		return result, warnings, nil
 	case "instant":
-		result, _, err := b.api.Query(ctx, expr, end)
+		result, warnings, err := b.api.Query(ctx, expr, end)
 		if err != nil {
-			return nil, fmt.Errorf("querying Prometheus instant: %w", err)
+			return nil, nil, fmt.Errorf("querying Prometheus instant: %w", err)
 		}
-		return result, nil
+		return result, warnings, nil
 	default:
-		return nil, fmt.Errorf("invalid query type: %s", queryType)
+		return nil, nil, fmt.Errorf("invalid query type: %s", queryType)
 	}
 }
 
@@ -199,49 +220,4 @@ func (rt *postToGetRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 	}
 
 	return rt.underlying.RoundTrip(cloned)
-}
-
-// doDSQuery posts payload to Grafana's /api/ds/query endpoint and decodes the
-// response. Shared by backends that route queries through the datasource query
-// API instead of a datasource-specific client.
-func doDSQuery(ctx context.Context, client *http.Client, baseURL string, payload map[string]interface{}) (*dsQueryResponse, error) {
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("marshaling query payload: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/ds/query", bytes.NewReader(payloadBytes))
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("executing request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	body, err := readResponseBody(resp.Body, defaultResponseLimitBytes)
-	if err != nil {
-		return nil, fmt.Errorf("reading response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("query returned status %d: %s", resp.StatusCode, string(body[:min(len(body), 1024)]))
-	}
-
-	var queryResp dsQueryResponse
-	if err := json.Unmarshal(body, &queryResp); err != nil {
-		return nil, fmt.Errorf("unmarshaling response: %w", err)
-	}
-
-	return &queryResp, nil
-}
-
-func trimTrailingSlash(s string) string {
-	for len(s) > 0 && s[len(s)-1] == '/' {
-		s = s[:len(s)-1]
-	}
-	return s
 }
