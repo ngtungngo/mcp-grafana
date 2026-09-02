@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	mcpgrafana "github.com/grafana/mcp-grafana"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -374,5 +375,153 @@ func TestRunPanelQuery_InfluxDB_E2E(t *testing.T) {
 		assert.Contains(t, result.Results, 1)
 		assert.Contains(t, result.Results, 2)
 		assert.Empty(t, result.Errors)
+	})
+}
+
+// createGenericTestDashboard creates a dashboard whose panels are backed by
+// Elasticsearch. Elasticsearch has no dedicated execution path in
+// run_panel_query, so these panels exercise the generic path: the raw target is
+// forwarded to Grafana's datasource query API, which means datasource-specific
+// fields (metrics, bucketAggs, timeField) have to survive interpolation intact.
+func createGenericTestDashboard(t *testing.T) string {
+	t.Helper()
+	ctx := newTestContext()
+
+	esTarget := func(query string) map[string]interface{} {
+		return map[string]interface{}{
+			"refId":     "A",
+			"query":     query,
+			"timeField": "@timestamp",
+			"metrics": []interface{}{
+				map[string]interface{}{"id": "1", "type": "count"},
+			},
+			"bucketAggs": []interface{}{
+				map[string]interface{}{
+					"id":       "2",
+					"type":     "date_histogram",
+					"field":    "@timestamp",
+					"settings": map[string]interface{}{"interval": "auto"},
+				},
+			},
+		}
+	}
+
+	dashJSON := map[string]interface{}{
+		"uid":   "generic-ds-test-dashboard",
+		"title": "Generic Datasource Integration Test",
+		"templating": map[string]interface{}{
+			"list": []interface{}{
+				map[string]interface{}{
+					"name":    "service",
+					"type":    "constant",
+					"query":   "api-gateway",
+					"current": map[string]interface{}{"value": "api-gateway"},
+				},
+			},
+		},
+		"panels": []interface{}{
+			// Panel 1: plain generic query, no variables.
+			map[string]interface{}{
+				"id":         float64(1),
+				"title":      "ES all logs",
+				"type":       "timeseries",
+				"datasource": map[string]interface{}{"type": "elasticsearch", "uid": "elasticsearch"},
+				"targets":    []interface{}{esTarget("*")},
+			},
+			// Panel 2: generic query with a dashboard variable. If ${service} is
+			// not substituted, Elasticsearch matches nothing and the assertion
+			// on returned frames fails.
+			map[string]interface{}{
+				"id":         float64(2),
+				"title":      "ES logs by service",
+				"type":       "timeseries",
+				"datasource": map[string]interface{}{"type": "elasticsearch", "uid": "elasticsearch"},
+				"targets":    []interface{}{esTarget("service:${service}")},
+			},
+		},
+	}
+
+	raw, err := json.Marshal(dashJSON)
+	require.NoError(t, err)
+
+	var dashboard map[string]interface{}
+	require.NoError(t, json.Unmarshal(raw, &dashboard))
+
+	_, err = updateDashboard(ctx, UpdateDashboardParams{
+		Dashboard: dashboard,
+		Overwrite: true,
+	})
+	require.NoError(t, err)
+
+	return "generic-ds-test-dashboard"
+}
+
+func deleteGenericTestDashboard(t *testing.T, uid string) {
+	t.Helper()
+	ctx := newTestContext()
+	c := mcpgrafana.GrafanaClientFromContext(ctx)
+	_, _ = c.Dashboards.DeleteDashboardByUID(uid)
+}
+
+// TestRunPanelQuery_GenericDatasource_E2E verifies the generic path end to end
+// against a real datasource that run_panel_query has no dedicated handler for.
+// Before the generic fallback existed, every one of these calls failed with
+// "datasource type ... is not supported by run_panel_query".
+func TestRunPanelQuery_GenericDatasource_E2E(t *testing.T) {
+	uid := createGenericTestDashboard(t)
+	defer deleteGenericTestDashboard(t, uid)
+
+	ctx := newTestContext()
+
+	assertHasFrames := func(t *testing.T, results interface{}) {
+		t.Helper()
+		responses, ok := results.(backend.Responses)
+		require.True(t, ok, "expected backend.Responses, got %T", results)
+		require.Contains(t, responses, "A")
+		require.NoError(t, responses["A"].Error)
+		assert.NotEmpty(t, responses["A"].Frames, "expected frames for the seeded log data")
+	}
+
+	t.Run("panel on a datasource without a dedicated handler", func(t *testing.T) {
+		result, err := runPanelQuery(ctx, RunPanelQueryParams{
+			DashboardUID: uid,
+			PanelIDs:     []int{1},
+			Start:        "now-1h",
+			End:          "now",
+		})
+		require.NoError(t, err)
+		require.Contains(t, result.Results, 1)
+		assert.Empty(t, result.Errors)
+		assert.Equal(t, "elasticsearch", result.Results[1].DatasourceType)
+		assertHasFrames(t, result.Results[1].Results)
+	})
+
+	t.Run("dashboard variable is substituted on the generic path", func(t *testing.T) {
+		result, err := runPanelQuery(ctx, RunPanelQueryParams{
+			DashboardUID: uid,
+			PanelIDs:     []int{2},
+			Start:        "now-1h",
+			End:          "now",
+		})
+		require.NoError(t, err)
+		require.Contains(t, result.Results, 2)
+		assert.Empty(t, result.Errors)
+		assert.Equal(t, "service:api-gateway", result.Results[2].Query)
+		assertHasFrames(t, result.Results[2].Results)
+	})
+
+	t.Run("variable override is applied on the generic path", func(t *testing.T) {
+		result, err := runPanelQuery(ctx, RunPanelQueryParams{
+			DashboardUID: uid,
+			PanelIDs:     []int{2},
+			Start:        "now-1h",
+			End:          "now",
+			Variables:    map[string]string{"service": "order-service"},
+		})
+		require.NoError(t, err)
+		require.Contains(t, result.Results, 2)
+		assert.Empty(t, result.Errors)
+		assert.Equal(t, "service:order-service", result.Results[2].Query)
+		assertHasFrames(t, result.Results[2].Results)
 	})
 }
